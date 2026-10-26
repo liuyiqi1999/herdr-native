@@ -1,0 +1,13 @@
+dist/
+herdr/
+ghostty/
+__pycache__/
+.tools/
+.local/
+.DS_Store
+backups/
+herdr-worktrees/
+*.profraw
+.env
+.env.*
+!.env.example

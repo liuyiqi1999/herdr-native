@@ -1,0 +1,3029 @@
+diff --git a/src/api/schema.rs b/src/api/schema.rs
+index 8077377..d2d48e0 100644
+--- a/src/api/schema.rs
++++ b/src/api/schema.rs
+@@ -119,7 +119,7 @@ operations::define_operations! {
+     PaneRename(PaneRenameParams) => "pane.rename", true, true;
+     PaneSendText(PaneSendTextParams) => "pane.send_text", false, false;
+     PaneSendKeys(PaneSendKeysParams) => "pane.send_keys", false, false;
+-    PaneSendInput(PaneSendInputParams) => "pane.send_input", false, false;
++    PaneSendInput(PaneSendInputParams) => "pane.send_input", false, true;
+     PaneRead(PaneReadParams) => "pane.read", false, false;
+     PaneReportAgent(PaneReportAgentParams) => "pane.report_agent", true, false;
+     PaneReportAgentSession(PaneReportAgentSessionParams) => "pane.report_agent_session", true, false;
+diff --git a/src/client/endpoint_commands.rs b/src/client/endpoint_commands.rs
+index 8e77b79..d97d4fa 100644
+--- a/src/client/endpoint_commands.rs
++++ b/src/client/endpoint_commands.rs
+@@ -75,16 +75,37 @@ impl EndpointCommands {
+         generation: u64,
+         boot_id: String,
+         request: Box<Request>,
+-    ) {
+-        self.lanes
+-            .entry(endpoint_id)
+-            .or_default()
++    ) -> Option<String> {
++        let lane = self.lanes.entry(endpoint_id).or_default();
++        // Consecutive absolute workspace selections have no intermediate side
++        // effects. Keep only the latest unsent target instead of paying one SSH
++        // round trip for every key repeat. Never cross an intervening command,
++        // connection generation, or server boot boundary.
++        let superseded = lane
+             .queued
+-            .push_back(QueuedCommand {
+-                generation,
+-                boot_id,
+-                request,
+-            });
++            .back()
++            .filter(|previous| {
++                previous.generation == generation
++                    && previous.boot_id == boot_id
++                    && matches!(
++                        previous.request.method,
++                        crate::api::schema::Method::WorkspaceFocus(_)
++                    )
++                    && matches!(
++                        request.method,
++                        crate::api::schema::Method::WorkspaceFocus(_)
++                    )
++            })
++            .map(|previous| previous.request.id.clone());
++        if superseded.is_some() {
++            lane.queued.pop_back();
++        }
++        lane.queued.push_back(QueuedCommand {
++            generation,
++            boot_id,
++            request,
++        });
++        superseded
+     }
+ 
+     pub(super) fn send_next(
+@@ -330,6 +351,66 @@ mod tests {
+             .is_some_and(|lane| lane.in_flight.is_some())
+     }
+ 
++    fn focus_request(id: &str) -> Box<Request> {
++        Box::new(Request {
++            id: id.into(),
++            method: crate::api::schema::Method::WorkspaceFocus(
++                crate::api::schema::WorkspaceTarget {
++                    workspace_id: id.into(),
++                },
++            ),
++        })
++    }
++
++    #[test]
++    fn workspace_key_burst_keeps_only_latest_unsent_target() {
++        let mut commands = commands_with_in_flight();
++        for index in 0..100 {
++            let replaced = commands.enqueue(
++                endpoint(),
++                1,
++                "boot-a".into(),
++                focus_request(&index.to_string()),
++            );
++            assert_eq!(replaced, (index > 0).then(|| (index - 1).to_string()));
++        }
++        let lane = &commands.lanes[&endpoint()];
++        assert_eq!(lane.queued.len(), 1);
++        assert_eq!(lane.queued[0].request.id, "99");
++        assert_eq!(lane.in_flight.as_ref().unwrap().request_id, "request-a");
++    }
++
++    #[test]
++    fn workspace_coalescing_preserves_command_and_identity_boundaries() {
++        let mut commands = EndpointCommands::default();
++        assert!(commands
++            .enqueue(endpoint(), 1, "boot-a".into(), focus_request("a"))
++            .is_none());
++        assert!(commands
++            .enqueue(endpoint(), 2, "boot-a".into(), focus_request("b"))
++            .is_none());
++        assert!(commands
++            .enqueue(endpoint(), 2, "boot-b".into(), focus_request("c"))
++            .is_none());
++        assert!(commands
++            .enqueue(
++                endpoint(),
++                2,
++                "boot-b".into(),
++                Box::new(Request {
++                    id: "list".into(),
++                    method: crate::api::schema::Method::WorkspaceList(
++                        crate::api::schema::EmptyParams::default()
++                    ),
++                })
++            )
++            .is_none());
++        assert!(commands
++            .enqueue(endpoint(), 2, "boot-b".into(), focus_request("d"))
++            .is_none());
++        assert_eq!(commands.lanes[&endpoint()].queued.len(), 5);
++    }
++
+     #[test]
+     fn chunked_response_completion_is_correlated_and_clears_the_lane() {
+         let mut commands = commands_with_in_flight();
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index b8039f4..fd7d525 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -2345,11 +2345,13 @@ async fn run_client_loop(
+                             outcome.repaint |= repaint;
+                             outcome.actions.extend(actions);
+                         }
++                        shell.tick_native_tab_groups(now, &mut outcome);
+                         let (effects, notification_repaint) = shell.tick_notifications(now);
+                         outcome.repaint |= notification_repaint
+                             | shell.tick_copy_feedback(now)
+                             | shell.tick_workspace_highlight(now)
+-                            | shell.tick_endpoint_error(now);
++                            | shell.tick_endpoint_error(now)
++                            | shell.tick_native_editor();
+                         let frame = outcome
+                             .repaint
+                             .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+diff --git a/src/client/shell.rs b/src/client/shell.rs
+index 2d18044..80efc35 100644
+--- a/src/client/shell.rs
++++ b/src/client/shell.rs
+@@ -4,6 +4,10 @@ mod actions;
+ mod agent_sidebar;
+ mod aggregate_navigation;
+ mod machine_diagnostics;
++mod native_editor;
++mod native_tab_groups;
++mod remote_agents;
++mod tab_sidebar;
+ mod workspace_navigation;
+ use workspace_navigation::{PendingWorkspaceHighlight, WorkspaceNavigationTarget};
+ mod composition;
+diff --git a/src/client/shell/actions.rs b/src/client/shell/actions.rs
+index 83819b0..d5bbc1d 100644
+--- a/src/client/shell/actions.rs
++++ b/src/client/shell/actions.rs
+@@ -20,6 +20,11 @@ impl ClientShellState {
+                 self.persist_chrome_preferences(outcome);
+             }
+             crate::input::KeybindMatch::Action(action) => {
++                if matches!(action, crate::input::KeybindAction::SplitVertical | crate::input::KeybindAction::SplitHorizontal)
++                    && self.split_native_tab_group_for(None, if action == crate::input::KeybindAction::SplitHorizontal { "down" } else { "right" }, outcome)
++                {
++                    return;
++                }
+                 if self.workspace_preview_action_blocked()
+                     && matches!(
+                         action,
+@@ -179,6 +184,21 @@ impl ClientShellState {
+                 outcome.actions.push(ClientShellAction::Keybind(action));
+             }
+             crate::input::KeybindMatch::Command(command) => {
++                if command.command == "herdr-native:new-agent" {
++                    self.toggle_global_menu();
++                    if let (Some(ClientShellOverlay::GlobalMenu(menu)), Some(snapshot)) =
++                        (&mut self.overlay, self.snapshot.as_deref())
++                    {
++                        menu.highlighted = global_menu::global_menu_items(snapshot)
++                            .iter()
++                            .position(|(_, action)| {
++                                *action == global_menu::ClientGlobalMenuAction::RemotePi
++                            })
++                            .unwrap_or(0);
++                    }
++                    outcome.repaint = true;
++                    return;
++                }
+                 let action = command.action.into();
+                 let resolved_labels = command.bindings.labels();
+                 let command_id = self.snapshot.as_deref().and_then(|snapshot| {
+@@ -307,7 +327,32 @@ impl ClientShellState {
+         method: crate::api::schema::Method,
+         outcome: &mut ClientShellInput,
+     ) {
+-        self.push_endpoint_method_with_kind(method, PendingEndpointKind::Generic, outcome);
++        if self.config.prompt_new_tab_command {
++            if let crate::api::schema::Method::TabCreate(params) = method {
++                let command = if self.config.new_tab_command.trim().is_empty() {
++                    "pi"
++                } else {
++                    &self.config.new_tab_command
++                };
++                self.overlay = Some(ClientShellOverlay::Rename(ClientRenameOverlay {
++                    title: "start command: ↑↓ pi / claude (empty = shell)",
++                    input: TextEditor::new(command, true),
++                    target: ClientRenameTarget::LaunchTab { params },
++                }));
++                outcome.repaint = true;
++                return;
++            }
++        }
++        let kind = if matches!(method, crate::api::schema::Method::TabCreate(_))
++            && !self.config.new_tab_command.trim().is_empty()
++        {
++            PendingEndpointKind::NewTabCommand {
++                command: self.config.new_tab_command.clone(),
++            }
++        } else {
++            PendingEndpointKind::Generic
++        };
++        self.push_endpoint_method_with_kind(method, kind, outcome);
+     }
+ 
+     pub(super) fn push_endpoint_notice(
+@@ -496,6 +541,18 @@ impl ClientShellState {
+         repaint
+     }
+ 
++    /// An unsent workspace selection was replaced by a newer selection. This is
++    /// normal key-repeat coalescing, not an interrupted or failed server action.
++    pub(crate) fn supersede_workspace_request(&mut self, request_id: &str) {
++        if self
++            .pending_requests
++            .get(request_id)
++            .is_some_and(|request| request.method_name == "workspace.focus")
++        {
++            self.pending_requests.remove(request_id);
++        }
++    }
++
+     pub(crate) fn handle_endpoint_result(
+         &mut self,
+         boot_id: &str,
+@@ -513,6 +570,9 @@ impl ClientShellState {
+         {
+             return (false, Vec::new());
+         }
++        if let Ok(crate::api::schema::ResponseResult::TabCreated { tab, .. }) = &result {
++            self.claim_native_group_tab(boot_id, &tab.tab_id);
++        }
+         if let PendingEndpointKind::PaneLinkResolve { target } = pending.kind {
+             return self.complete_link_hover(target, result);
+         }
+@@ -568,6 +628,25 @@ impl ClientShellState {
+         }
+         match pending.kind {
+             PendingEndpointKind::Generic => {}
++            PendingEndpointKind::NewTabCommand { command } => {
++                if let Ok(crate::api::schema::ResponseResult::TabCreated { root_pane, .. }) = result
++                {
++                    // Use the returned pane identity, never the currently focused pane.
++                    // Pending requests are retired on endpoint changes and consumed once.
++                    let mut outcome = ClientShellInput::default();
++                    self.push_endpoint_method(
++                        crate::api::schema::Method::PaneSendInput(
++                            crate::api::schema::PaneSendInputParams {
++                                pane_id: root_pane.pane_id,
++                                text: command,
++                                keys: vec!["Enter".into()],
++                            },
++                        ),
++                        &mut outcome,
++                    );
++                    return (outcome.repaint, outcome.actions);
++                }
++            }
+             PendingEndpointKind::PaneLinkResolve { .. } => unreachable!("handled above"),
+             PendingEndpointKind::ProductAnnouncementDismiss { version, id } => {
+                 return match result {
+diff --git a/src/client/shell/agent_sidebar.rs b/src/client/shell/agent_sidebar.rs
+index e43ab8c..b8a2e23 100644
+--- a/src/client/shell/agent_sidebar.rs
++++ b/src/client/shell/agent_sidebar.rs
+@@ -57,6 +57,12 @@ pub(super) fn render_agent_panel(
+     agent_scroll: &mut usize,
+     hits: &mut ShellHitMap,
+ ) {
++    if snapshot.agent_view_label.is_none() {
++        let mut rows = Vec::new();
++        super::tab_sidebar::append_rows(&mut rows, snapshot, None, true);
++        super::tab_sidebar::render(buffer, area, &rows, config, agent_scroll, hits);
++        return;
++    }
+     if !render_agent_panel_header(
+         buffer,
+         area,
+@@ -79,6 +85,7 @@ pub(super) fn render_agent_panel(
+         config,
+         agent_scroll,
+         hits,
++        config.agents.row_gap,
+         |row| row.rows.len(),
+         |buffer, rect, row, hits| {
+             hits.agents.push((rect, row.pane_id.clone()));
+@@ -159,14 +166,15 @@ pub(super) fn render_agent_list<T>(
+     config: &ClientShellConfig,
+     agent_scroll: &mut usize,
+     hits: &mut ShellHitMap,
++    row_gap: u16,
+     row_lines: impl Fn(&T) -> usize,
+     mut render_row: impl FnMut(&mut Buffer, Rect, &T, &mut ShellHitMap),
+ ) {
+     let body = Rect::new(
+         area.x,
+-        area.y.saturating_add(3),
++        area.y.saturating_add(2),
+         area.width,
+-        area.height.saturating_sub(3),
++        area.height.saturating_sub(2),
+     );
+     hits.agent_body = body;
+     if body.is_empty() || rows.is_empty() {
+@@ -193,13 +201,15 @@ pub(super) fn render_agent_list<T>(
+     let gaps = rows
+         .iter()
+         .enumerate()
+-        .map(|(index, _)| {
+-            if index + 1 < rows.len() {
+-                config.agents.row_gap
+-            } else {
+-                0
+-            }
+-        })
++        .map(
++            |(index, _)| {
++                if index + 1 < rows.len() {
++                    row_gap
++                } else {
++                    0
++                }
++            },
++        )
+         .collect::<Vec<_>>();
+     let metrics =
+         super::scroll::list_scroll_metrics(&row_heights, &gaps, body.height, *agent_scroll);
+@@ -220,11 +230,7 @@ pub(super) fn render_agent_list<T>(
+         render_row(buffer, rect, row, hits);
+         y = y
+             .saturating_add(height)
+-            .saturating_add(if index + 1 < rows.len() {
+-                config.agents.row_gap
+-            } else {
+-                0
+-            });
++            .saturating_add(if index + 1 < rows.len() { row_gap } else { 0 });
+     }
+ 
+     if show_scrollbar {
+diff --git a/src/client/shell/composition.rs b/src/client/shell/composition.rs
+index b7ab4a9..a07d27b 100644
+--- a/src/client/shell/composition.rs
++++ b/src/client/shell/composition.rs
+@@ -170,7 +170,7 @@ impl ClientShellState {
+                     && pending.target.endpoint_id == self.active_endpoint_id
+                     && self.navigation_target_valid(&pending.target)
+             });
+-        if self.snapshot.is_none() || self.pane_surface.is_none() {
++        if self.snapshot.is_none() || self.pane_surface.is_none() || !self.native_group_surface_ready() {
+             return Some(self.compose_unavailable(cols, rows).into());
+         }
+         let snapshot = self.snapshot.as_deref()?;
+@@ -344,6 +344,9 @@ impl ClientShellState {
+             frame.cells[start..start + usize::from(bar.width)].to_vec()
+         });
+         blit_pane_surface(&mut frame, &surface.frame, layout.pane_surface);
++        if self.mode == ClientShellMode::Terminal && self.overlay.is_none() {
++            self.native_editors.blit(&mut frame, layout.pane_surface);
++        }
+         restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
+         let mut occlusion = crate::kitty_graphics::surface::Occlusion::default();
+         let has_selection = self
+diff --git a/src/client/shell/config.rs b/src/client/shell/config.rs
+index 04a3ddb..34f7114 100644
+--- a/src/client/shell/config.rs
++++ b/src/client/shell/config.rs
+@@ -1,5 +1,19 @@
+ use super::*;
+ 
++// Native's prompt is client-only. Avoid requiring a config key that an older,
++// still-running backend doesn't understand. Explicit user choices still win.
++fn native_new_tab_prompt(configured: bool) -> bool {
++    if std::env::var_os("HERDR_NATIVE_GROUP_ROOT").is_none() {
++        return configured;
++    }
++    std::fs::read_to_string(crate::config::config_path())
++        .ok()
++        .and_then(|text| text.parse::<toml::Value>().ok())
++        .map(|value| value.get("ui").and_then(|ui| ui.get("prompt_new_tab_command"))
++            .and_then(toml::Value::as_bool).unwrap_or(true))
++        .unwrap_or(configured)
++}
++
+ pub(super) fn merged_config_diagnostic(
+     local: Option<&str>,
+     endpoint: Option<&str>,
+@@ -145,6 +159,8 @@ impl ClientShellConfig {
+             local_keys: config.keys.clone(),
+             keybinding_source: ClientShellKeybindingSource::Local,
+             prompt_new_tab_name: config.ui.prompt_new_tab_name,
++            new_tab_command: config.ui.new_tab_command.clone(),
++            prompt_new_tab_command: native_new_tab_prompt(config.ui.prompt_new_tab_command),
+             prompt_new_workspace_name: config.ui.prompt_new_workspace_name,
+             confirm_close: config.ui.confirm_close,
+             mouse_capture: config.ui.mouse_capture,
+@@ -240,8 +256,19 @@ impl ClientShellConfig {
+                     keys: self.local_keys.clone(),
+                     ..Default::default()
+                 };
++                let native_commands: Vec<_> = self
++                    .local_keys
++                    .command
++                    .iter()
++                    .filter(|command| command.command == "herdr-native:new-agent")
++                    .cloned()
++                    .collect();
+                 config.keys.command = commands
+                     .iter()
++                    .filter(|command| {
++                        native_commands.is_empty()
++                            || command.description.as_deref() != Some("New remote agent")
++                    })
+                     .filter_map(|command| {
+                         let action_type = match command.action {
+                             crate::protocol::ClientShellCommandAction::Shell => {
+@@ -274,6 +301,7 @@ impl ClientShellConfig {
+                         })
+                     })
+                     .collect();
++                config.keys.command.extend(native_commands);
+                 config
+                     .live_keybinds_with_diagnostics()
+                     .map(|(keybinds, _diagnostics)| keybinds)
+@@ -360,6 +388,8 @@ impl ClientShellConfig {
+                 self.clipboard_toast_enabled = ui.toast.clipboard.enabled;
+                 self.clipboard_toast_position = ui.toast.clipboard.position;
+                 self.prompt_new_tab_name = ui.prompt_new_tab_name;
++                self.new_tab_command = ui.new_tab_command.clone();
++                self.prompt_new_tab_command = native_new_tab_prompt(ui.prompt_new_tab_command);
+                 self.prompt_new_workspace_name = ui.prompt_new_workspace_name;
+                 self.confirm_close = ui.confirm_close;
+                 self.mouse_capture = ui.mouse_capture;
+diff --git a/src/client/shell/context_menu.rs b/src/client/shell/context_menu.rs
+index a7d6322..a1d21cb 100644
+--- a/src/client/shell/context_menu.rs
++++ b/src/client/shell/context_menu.rs
+@@ -49,6 +49,10 @@ impl ClientContextMenuOverlay {
+                 item("New tab", Action::NewTab),
+                 item("Rename", Action::Rename),
+                 item("Close", Action::Close),
++                item("Split to right", Action::SplitTabRight),
++                item("Split to down", Action::SplitTabDown),
++                item("Split to left", Action::SplitTabLeft),
++                item("Split to up", Action::SplitTabUp),
+             ],
+             ClientContextMenuTarget::Pane {
+                 source_pane_id,
+@@ -351,6 +355,18 @@ impl ClientShellState {
+             ClientContextMenuAction::Close => {
+                 self.request_tab_close(tab_id, outcome);
+             }
++            ClientContextMenuAction::SplitTabRight | ClientContextMenuAction::SplitTabDown
++            | ClientContextMenuAction::SplitTabLeft | ClientContextMenuAction::SplitTabUp => {
++                let direction = match action {
++                    ClientContextMenuAction::SplitTabLeft => "left",
++                    ClientContextMenuAction::SplitTabUp => "up",
++                    ClientContextMenuAction::SplitTabDown => "down",
++                    _ => "right",
++                };
++                if !self.split_native_tab_group_for(Some(&tab_id), direction, outcome) {
++                    self.set_endpoint_error("Native tab groups are not enabled in this client");
++                }
++            }
+             _ => {}
+         }
+     }
+diff --git a/src/client/shell/endpoint_agents.rs b/src/client/shell/endpoint_agents.rs
+index b56b41f..44e8eb8 100644
+--- a/src/client/shell/endpoint_agents.rs
++++ b/src/client/shell/endpoint_agents.rs
+@@ -52,6 +52,11 @@ pub(super) fn render_expanded(
+     agent_scroll: &mut usize,
+     hits: &mut ShellHitMap,
+ ) {
++    if agent_view_label.is_none() {
++        let rows = super::tab_sidebar::endpoint_rows(endpoints, active_endpoint_id);
++        super::tab_sidebar::render(buffer, area, &rows, config, agent_scroll, hits);
++        return;
++    }
+     if !super::agent_sidebar::render_agent_panel_header(
+         buffer,
+         area,
+@@ -70,6 +75,7 @@ pub(super) fn render_expanded(
+         config,
+         agent_scroll,
+         hits,
++        config.agents.row_gap,
+         |row| row.agent.rows.len(),
+         |buffer, rect, row, hits| {
+             super::agent_sidebar::render_agent_row(buffer, rect, &row.agent, config);
+@@ -97,6 +103,44 @@ impl ClientShellState {
+         if body_height == 0 {
+             return;
+         }
++        if self
++            .snapshot
++            .as_deref()
++            .is_some_and(|snapshot| snapshot.agent_view_label.is_none())
++        {
++            let rows = super::tab_sidebar::endpoint_rows(&self.endpoints, &self.active_endpoint_id);
++            // An agent can be in a split pane; reveal its containing tab's representative row.
++            let target_pane = self
++                .endpoints
++                .iter()
++                .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
++                .and_then(|endpoint| endpoint.snapshot.as_deref())
++                .and_then(|snapshot| {
++                    let pane = snapshot.panes.iter().find(|pane| pane.pane_id == pane_id)?;
++                    snapshot
++                        .panes
++                        .iter()
++                        .filter(|candidate| {
++                            candidate.workspace_id == pane.workspace_id
++                                && candidate.tab_id == pane.tab_id
++                        })
++                        .max_by_key(|candidate| candidate.focused)
++                });
++            if let Some(target) = rows.iter().position(|row| {
++                row.endpoint_id.as_ref() == Some(endpoint_id)
++                    && row.pane_id.as_deref() == target_pane.map(|pane| pane.pane_id.as_str())
++                    && row.pane_id.is_some()
++            }) {
++                self.agent_scroll = super::scroll::list_scroll_start_to_reveal(
++                    &vec![1; rows.len()],
++                    &vec![0; rows.len()],
++                    body_height,
++                    self.agent_scroll,
++                    target,
++                );
++            }
++            return;
++        }
+         let rows = agent_rows(&self.endpoints, &self.active_endpoint_id, &self.config);
+         let Some(target) = rows
+             .iter()
+diff --git a/src/client/shell/endpoint_navigation.rs b/src/client/shell/endpoint_navigation.rs
+index f1e268c..270fa81 100644
+--- a/src/client/shell/endpoint_navigation.rs
++++ b/src/client/shell/endpoint_navigation.rs
+@@ -146,8 +146,20 @@ impl ClientShellState {
+                 .snapshot
+                 .as_deref()
+                 .and_then(|snapshot| snapshot.focused_workspace_id.as_deref());
++            // Repeated keys must advance from the requested selection, not from a
++            // stale SSH snapshot. The existing preview carries boot/generation identity.
++            let pending = self
++                .pending_workspace_highlight
++                .as_ref()
++                .filter(|pending| self.navigation_target_valid(&pending.target));
+             let current = workspaces.iter().position(|(endpoint_id, workspace_id)| {
+-                endpoint_id == &self.active_endpoint_id && Some(workspace_id.as_str()) == focused
++                pending.map_or_else(
++                    || {
++                        endpoint_id == &self.active_endpoint_id
++                            && Some(workspace_id.as_str()) == focused
++                    },
++                    |pending| pending.target.matches(endpoint_id, workspace_id),
++                )
+             });
+             let next = match (current, action) {
+                 (Some(index), KeybindAction::PreviousWorkspace) => {
+@@ -159,11 +171,8 @@ impl ClientShellState {
+                 _ => unreachable!("endpoint workspace navigation"),
+             };
+             let (endpoint_id, workspace_id) = workspaces[next].clone();
+-            self.focus_or_activate(
+-                endpoint_id,
+-                ClientEndpointFocusTarget::Workspace(workspace_id),
+-                outcome,
+-            );
++            self.navigate_workspace_id = self.navigation_target(&endpoint_id, &workspace_id);
++            self.accept_navigate_workspace(outcome);
+             return true;
+         }
+         if matches!(
+diff --git a/src/client/shell/endpoints.rs b/src/client/shell/endpoints.rs
+index 9e71d00..1d1e64b 100644
+--- a/src/client/shell/endpoints.rs
++++ b/src/client/shell/endpoints.rs
+@@ -45,6 +45,11 @@ pub(crate) enum ClientEndpointFocusTarget {
+ 
+ impl ClientShellState {
+     pub(crate) fn set_endpoint_catalog(&mut self, profiles: &[SavedSshEndpoint]) {
++        self.native_editors.targets = profiles
++            .iter()
++            .filter(|profile| profile.enabled)
++            .map(|profile| (profile.id.to_string(), profile.target.clone()))
++            .collect();
+         let mut next = Vec::with_capacity(profiles.len().saturating_add(1));
+         let local = self
+             .endpoints
+diff --git a/src/client/shell/global_menu.rs b/src/client/shell/global_menu.rs
+index e5bd6f7..baf4e69 100644
+--- a/src/client/shell/global_menu.rs
++++ b/src/client/shell/global_menu.rs
+@@ -4,6 +4,9 @@ use super::*;
+ pub(super) enum ClientGlobalMenuAction {
+     Binding(crate::input::KeybindAction),
+     WhatsNew,
++    RemotePi,
++    RemoteCodex,
++    RemoteClaude,
+ }
+ 
+ pub(super) fn global_menu_attention(snapshot: &ClientShellSnapshot) -> bool {
+@@ -46,10 +49,13 @@ pub(super) fn global_menu_items(
+             ClientGlobalMenuAction::WhatsNew,
+         ));
+     }
++    items.push(("new remote pi", ClientGlobalMenuAction::RemotePi));
++    items.push(("new remote codex", ClientGlobalMenuAction::RemoteCodex));
+     items.push((
+         "detach",
+         ClientGlobalMenuAction::Binding(crate::input::KeybindAction::Detach),
+     ));
++    items.push(("new remote claude", ClientGlobalMenuAction::RemoteClaude));
+     items
+ }
+ 
+@@ -104,6 +110,9 @@ impl ClientShellState {
+                 self.record_binding(crate::input::KeybindMatch::Action(binding), outcome)
+             }
+             ClientGlobalMenuAction::WhatsNew => self.open_release_notes(),
++            ClientGlobalMenuAction::RemotePi => self.begin_native_agent("pi", outcome),
++            ClientGlobalMenuAction::RemoteCodex => self.begin_native_agent("codex", outcome),
++            ClientGlobalMenuAction::RemoteClaude => self.begin_native_agent("claude", outcome),
+         }
+         outcome.repaint = true;
+     }
+diff --git a/src/client/shell/input.rs b/src/client/shell/input.rs
+index ee92d59..34b671b 100644
+--- a/src/client/shell/input.rs
++++ b/src/client/shell/input.rs
+@@ -221,6 +221,11 @@ impl ClientShellState {
+     }
+ 
+     pub(crate) fn handle_raw_events(&mut self, events: Vec<RawInputEvent>) -> ClientShellInput {
++        // During a group transfer, never route input to the server's temporary
++        // fallback tab when that tab belongs to a different native surface.
++        if !self.native_group_surface_ready() {
++            return ClientShellInput::default();
++        }
+         let mut outcome = ClientShellInput::default();
+         if !events.is_empty() && self.endpoint_error.take().is_some() {
+             self.endpoint_error_deadline = None;
+@@ -636,12 +641,16 @@ impl ClientShellState {
+             return None;
+         }
+         if self.overlay.is_some() {
++            self.native_split_chord = None;
+             self.route_overlay_key(key, outcome);
+             return None;
+         }
+         if matches!(key.code, KeyCode::Modifier(_)) {
+             return None;
+         }
++        if self.mode == ClientShellMode::Terminal && self.native_split_key(key, outcome) {
++            return None;
++        }
+         self.word_selection_gesture = None;
+         if self.mode != ClientShellMode::Copy
+             && self.copy_or_terminal_mode() != ClientShellMode::Copy
+diff --git a/src/client/shell/mouse.rs b/src/client/shell/mouse.rs
+index 8e873d6..51334a4 100644
+--- a/src/client/shell/mouse.rs
++++ b/src/client/shell/mouse.rs
+@@ -1243,11 +1243,12 @@ impl ClientShellState {
+                     .abs_diff(press.start_column)
+                     .max(mouse.row.abs_diff(press.start_row));
+                 if delta >= 1 {
+-                    if let Some(insert_index) = self.tab_drop_index_at(point) {
++                    let insert_index = self.tab_drop_index_at(point);
++                    if insert_index.is_some() || self.native_tab_group.is_some() {
+                         self.chrome_drag = Some(ClientChromeDrag::Tab {
+                             tab_id: press.tab_id.clone(),
+                             workspace_id: press.workspace_id.clone(),
+-                            insert_index: Some(insert_index),
++                            insert_index,
+                         });
+                         outcome.repaint = true;
+                     }
+@@ -1265,6 +1266,10 @@ impl ClientShellState {
+                         workspace_id,
+                         ..
+                     } => {
++                        if self.move_native_tab_drop(&tab_id, outcome) {
++                            outcome.repaint = true;
++                            return;
++                        }
+                         let insert_index = self.tab_drop_index_at(point);
+                         let valid_drop = self.snapshot.as_deref().is_some_and(|snapshot| {
+                             snapshot.focused_workspace_id.as_deref() == Some(workspace_id.as_str())
+@@ -1728,7 +1733,11 @@ impl ClientShellState {
+                 }
+             } else if super::contains(self.hits.overlay_clear, point) {
+                 if let Some(ClientShellOverlay::Rename(rename)) = self.overlay.as_mut() {
+-                    rename.input.clear();
++                    if matches!(rename.target, ClientRenameTarget::LaunchTab { .. }) {
++                        rename.cycle_launch_command(false);
++                    } else {
++                        rename.input.clear();
++                    }
+                     outcome.repaint = true;
+                 }
+             } else {
+diff --git a/src/client/shell/overlay_input.rs b/src/client/shell/overlay_input.rs
+index 7f797ef..c488c3c 100644
+--- a/src/client/shell/overlay_input.rs
++++ b/src/client/shell/overlay_input.rs
+@@ -898,6 +898,13 @@ impl ClientShellState {
+         let Some(ClientShellOverlay::Rename(rename)) = self.overlay.as_mut() else {
+             return;
+         };
++        if matches!(rename.target, ClientRenameTarget::LaunchTab { .. })
++            && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab)
++        {
++            rename.cycle_launch_command(key.code == KeyCode::Up);
++            outcome.repaint = true;
++            return;
++        }
+         if key.code == KeyCode::Enter {
+             self.save_rename_overlay(outcome);
+             return;
+@@ -936,6 +943,22 @@ impl ClientShellState {
+         };
+         let trimmed = rename.input.trim();
+         let method = match rename.target {
++            ClientRenameTarget::LaunchTab { params } => {
++                let kind = if trimmed.is_empty() {
++                    PendingEndpointKind::Generic
++                } else {
++                    PendingEndpointKind::NewTabCommand {
++                        command: trimmed.to_owned(),
++                    }
++                };
++                self.push_endpoint_method_with_kind(
++                    crate::api::schema::Method::TabCreate(params),
++                    kind,
++                    outcome,
++                );
++                outcome.repaint = true;
++                return;
++            }
+             ClientRenameTarget::NewWorkspace {
+                 source_workspace_id,
+                 cwd,
+diff --git a/src/client/shell/overlays.rs b/src/client/shell/overlays.rs
+index f26cc6e..b914540 100644
+--- a/src/client/shell/overlays.rs
++++ b/src/client/shell/overlays.rs
+@@ -646,6 +646,7 @@ fn render_rename_overlay(
+     v: &ClientRenameOverlay,
+     p: &Palette,
+ ) -> Option<OverlayRender> {
++    let launch = matches!(v.target, ClientRenameTarget::LaunchTab { .. });
+     let q = popup(b.area, 56, 7)?;
+     let i = panel(b, q, p.accent, p.panel_bg)?;
+     put_text(
+@@ -674,7 +675,7 @@ fn render_rename_overlay(
+     button(
+         b,
+         *save,
+-        " ↵ save ",
++        if launch { " ↵ start" } else { " ↵ save " },
+         Style::default()
+             .fg(contrast(p))
+             .bg(p.accent)
+@@ -684,7 +685,12 @@ fn render_rename_overlay(
+         .fg(p.text)
+         .bg(p.surface0)
+         .add_modifier(Modifier::BOLD);
+-    button(b, *clear, " ^c clear ", n);
++    button(
++        b,
++        *clear,
++        if launch { " ⇅ choose " } else { " ^c clear " },
++        n,
++    );
+     button(b, *cancel, " esc cancel ", n);
+     Some(OverlayRender {
+         area: q,
+diff --git a/src/client/shell/render.rs b/src/client/shell/render.rs
+index 248216c..7714a82 100644
+--- a/src/client/shell/render.rs
++++ b/src/client/shell/render.rs
+@@ -11,7 +11,7 @@ pub(super) use super::agent_sidebar::{ordered_agent_pane_ids, render_agent_panel
+ pub(super) use super::aggregate_navigation::navigator_rows as client_navigator_rows;
+ pub(super) use overlays::{render_client_overlay, render_context_menu, render_global_menu};
+ pub(super) use sidebar::{render_collapsed_sidebar, render_sidebar, workspace_entries};
+-pub(super) use tabs::{render_tab_bar, tab_bar_status_width};
++pub(super) use tabs::{render_tab_bar, tab_bar_status_width, tab_label};
+ 
+ pub(in crate::client::shell) fn render_sidebar_background(
+     buffer: &mut Buffer,
+diff --git a/src/client/shell/state.rs b/src/client/shell/state.rs
+index 5a73292..6d6ee4a 100644
+--- a/src/client/shell/state.rs
++++ b/src/client/shell/state.rs
+@@ -39,6 +39,8 @@ pub(crate) struct ClientShellConfig {
+     pub(super) local_keys: crate::config::KeysConfig,
+     pub(super) keybinding_source: ClientShellKeybindingSource,
+     pub(super) prompt_new_tab_name: bool,
++    pub(super) new_tab_command: String,
++    pub(super) prompt_new_tab_command: bool,
+     pub(super) prompt_new_workspace_name: bool,
+     pub(super) confirm_close: bool,
+     pub(super) mouse_capture: bool,
+@@ -241,6 +243,10 @@ pub(super) struct WorkspaceHit {
+ 
+ #[derive(Debug)]
+ pub(crate) enum ClientShellAction {
++    OpenNativeAgent {
++        launcher: String,
++        args: Vec<String>,
++    },
+     Endpoint {
+         endpoint_id: ClientEndpointId,
+         boot_id: String,
+@@ -303,6 +309,9 @@ pub(super) enum ClientRenameTarget {
+     Workspace {
+         workspace_id: String,
+     },
++    LaunchTab {
++        params: crate::api::schema::TabCreateParams,
++    },
+     NewTab {
+         workspace_id: String,
+         default_name: String,
+@@ -324,6 +333,18 @@ pub(super) struct ClientRenameOverlay {
+     pub(super) target: ClientRenameTarget,
+ }
+ 
++impl ClientRenameOverlay {
++    pub(super) fn cycle_launch_command(&mut self, reverse: bool) {
++        let choices = ["pi", "claude", ""];
++        let current = choices
++            .iter()
++            .position(|value| *value == self.input.trim())
++            .unwrap_or(0);
++        let next = (current + if reverse { 2 } else { 1 }) % choices.len();
++        self.input = TextEditor::new(choices[next], true);
++    }
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub(super) enum ClientNavigatorFilter {
+     Blocked,
+@@ -522,6 +543,10 @@ pub(super) enum ClientContextMenuAction {
+     SwapWithFocusedPane,
+     SplitRight,
+     SplitDown,
++    SplitTabRight,
++    SplitTabDown,
++    SplitTabLeft,
++    SplitTabUp,
+     Zoom,
+     ToggleRightClickPassthrough,
+     ClosePane,
+@@ -619,6 +644,9 @@ impl ClientShellOverlay {
+ #[derive(Debug)]
+ pub(super) enum PendingEndpointKind {
+     Generic,
++    NewTabCommand {
++        command: String,
++    },
+     ProductAnnouncementDismiss {
+         version: String,
+         id: String,
+@@ -863,6 +891,9 @@ pub(crate) struct ClientShellState {
+     pub(super) active_snapshot_generation: Option<u64>,
+     pub(super) pane_surface_generation: Option<u64>,
+     pub(super) pane_surface: Option<PaneSurfaceFrame>,
++    pub(super) native_editors: super::native_editor::NativeEditors,
++    pub(super) native_tab_group: Option<super::native_tab_groups::NativeTabGroup>,
++    pub(super) native_split_chord: Option<(std::time::Instant, String)>,
+     /// A future projection surface waits here until its matching snapshot arrives. The visible
+     /// pane surface always remains an exact snapshot pair.
+     pub(super) pending_pane_surface: Option<PaneSurfaceFrame>,
+@@ -999,7 +1030,9 @@ impl ClientShellState {
+         let overlay = config
+             .startup_onboarding
+             .then_some(ClientShellOverlay::Onboarding);
+-        let sidebar_collapsed = preferences
++        let native_secondary = std::env::var_os("HERDR_NATIVE_GROUP_ROOT").is_some()
++            && std::env::var("HERDR_NATIVE_GROUP_ID").is_ok_and(|id| id != "main");
++        let sidebar_collapsed = native_secondary || preferences
+             .sidebar_collapsed
+             .unwrap_or(config.sidebar_start_collapsed);
+         let (min_width, max_width) = crate::config::validated_sidebar_bounds(
+@@ -1036,6 +1069,9 @@ impl ClientShellState {
+             active_snapshot_generation: None,
+             pane_surface_generation: None,
+             pane_surface: None,
++            native_editors: Default::default(),
++            native_tab_group: super::native_tab_groups::NativeTabGroup::from_env(),
++            native_split_chord: None,
+             pending_pane_surface: None,
+             graphics: crate::kitty_graphics::surface::ClientState::new(),
+             graphics_cell_size: crate::kitty_graphics::HostCellSize {
+@@ -1301,6 +1337,7 @@ impl ClientShellState {
+         mut snapshot: Box<ClientShellSnapshot>,
+         generation: Option<u64>,
+     ) {
++        self.filter_native_group_snapshot(&mut snapshot);
+         snapshot
+             .commands
+             .retain(|command| command.action != crate::protocol::ClientShellCommandAction::Unknown);
+@@ -1417,7 +1454,8 @@ impl ClientShellState {
+                     .any(|(left, right)| {
+                         left.tab_id != right.tab_id
+                             || left.workspace_id != right.workspace_id
+-                            || left.label != right.label
++                            || render::tab_label(left, current)
++                                != render::tab_label(right, &snapshot)
+                             || left.zoomed != right.zoomed
+                     })
+                 || render::tab_bar_status_width(current) != render::tab_bar_status_width(&snapshot)
+@@ -1804,6 +1842,7 @@ impl ClientShellState {
+             .set_scene(std::mem::take(&mut surface.graphics));
+         self.pane_surface = Some(surface);
+         self.pane_surface_generation = self.active_snapshot_generation;
++        self.tick_native_editor();
+         self.invalidate_link_hover();
+         self.resume_mobile_switcher_if_ready();
+         self.reconcile_input_source();
+@@ -1879,7 +1918,11 @@ impl ClientShellState {
+     }
+ 
+     pub(crate) fn timer_delay(&self, now: std::time::Instant) -> std::time::Duration {
+-        let default = std::time::Duration::from_millis(100);
++        let default = std::time::Duration::from_millis(if self.native_editors.active() {
++            16
++        } else {
++            100
++        });
+         self.selection_autoscroll_deadline
+             .into_iter()
+             .chain(self.selection_repaint_deadline)
+diff --git a/src/client/shell/tabs.rs b/src/client/shell/tabs.rs
+index 3fdcf7d..90e7454 100644
+--- a/src/client/shell/tabs.rs
++++ b/src/client/shell/tabs.rs
+@@ -24,7 +24,7 @@ pub(crate) fn render_tab_bar(
+     let desired_widths = tabs
+         .iter()
+         .map(|tab| {
+-            let label = tab_label(tab);
++            let label = tab_label(tab, snapshot);
+             display_width(&label).saturating_add(4).max(MIN_TAB_WIDTH)
+         })
+         .collect::<Vec<_>>();
+@@ -92,7 +92,7 @@ pub(crate) fn render_tab_bar(
+     let mut first_visible = None;
+     let mut last_visible = None;
+     for (index, tab) in tabs.iter().enumerate().skip(*tab_scroll) {
+-        let name = tab_label(tab);
++        let name = tab_label(tab, snapshot);
+         let desired = desired_widths[index];
+         let remaining = tab_right.saturating_sub(x);
+         let width = desired.min(remaining);
+@@ -371,17 +371,116 @@ fn max_tab_scroll(widths: &[u16], available: u16) -> usize {
+     start
+ }
+ 
+-fn tab_label(tab: &ClientShellTab) -> String {
++pub(crate) fn tab_label(tab: &ClientShellTab, snapshot: &ClientShellSnapshot) -> String {
++    let title = snapshot
++        .agents
++        .iter()
++        .filter(|agent| agent.tab_id == tab.tab_id && agent.workspace_id == tab.workspace_id)
++        .filter_map(|agent| {
++            let raw = agent
++                .terminal_title_stripped
++                .as_deref()
++                .or(agent.terminal_title.as_deref())?;
++            let title = pi_session_title(raw).or_else(|| {
++                let is_claude = agent.agent.as_deref() == Some("claude")
++                    || agent
++                        .display_agent
++                        .as_deref()
++                        .is_some_and(|name| name.eq_ignore_ascii_case("claude"));
++                let title = raw.trim();
++                (is_claude && !title.is_empty() && !title.eq_ignore_ascii_case("claude code"))
++                    .then_some(title)
++            })?;
++            Some((agent.focused, title))
++        })
++        .max_by_key(|(focused, _)| *focused)
++        .map(|(_, title)| title);
++    let label = match title {
++        Some(title) if tab.custom_label => format!("{} · {} · {title}", tab.number, tab.label),
++        Some(title) => format!("{} · {title}", tab.number),
++        None => tab.label.clone(),
++    };
+     if tab.zoomed {
+-        format!("{} Z", tab.label)
++        format!("{label} Z")
+     } else {
+-        tab.label.clone()
++        label
+     }
+ }
+ 
++fn pi_session_title(raw: &str) -> Option<&str> {
++    // Pi emits “π - session name - cwd”; the unnamed form has only cwd.
++    // Recognize the title itself so RPC adapters also work without process detection.
++    let rest = raw
++        .strip_prefix("π - ")
++        .or_else(|| raw.strip_prefix("pi - "))?;
++    let (name, _) = rest.rsplit_once(" - ")?;
++    let name = name.trim();
++    (!name.is_empty()).then_some(name)
++}
++
+ #[cfg(test)]
+ mod tests {
+-    use super::max_tab_scroll;
++    use super::{max_tab_scroll, pi_session_title, tab_label};
++
++    #[test]
++    fn pi_titles_preserve_session_text_and_ignore_unnamed_sessions() {
++        assert_eq!(
++            pi_session_title("π - 修复 tab - 标题 - repo"),
++            Some("修复 tab - 标题")
++        );
++        assert_eq!(pi_session_title("pi - 自动标题 - repo"), Some("自动标题"));
++        assert_eq!(pi_session_title("π - repo"), None);
++        assert_eq!(pi_session_title("π -  - repo"), None);
++        assert_eq!(pi_session_title("vim - file - repo"), None);
++    }
++
++    #[test]
++    fn pi_tab_title_tracks_updates_keeps_number_and_selects_focused_pane() {
++        let mut snapshot = crate::client::shell::tests::snapshot();
++        let agent = |pane: &str, title: &str, focused: bool| crate::protocol::ClientShellAgent {
++            pane_id: pane.into(),
++            workspace_id: "ws_1".into(),
++            tab_id: "tab_1".into(),
++            name: None,
++            display_agent: None,
++            agent: None,
++            title: None,
++            terminal_title: Some(title.into()),
++            terminal_title_stripped: Some(title.into()),
++            agent_status: crate::api::schema::AgentStatus::Idle,
++            state_change_seq: 0,
++            state_labels: Vec::new(),
++            tokens: Vec::new(),
++            focused,
++        };
++        snapshot.agents = vec![
++            agent("pane_1", "π - 修复标题 - repo", true),
++            agent("pane_2", "π - 其他任务 - repo", false),
++        ];
++        assert_eq!(tab_label(&snapshot.tabs[0], &snapshot), "1 · 修复标题");
++        snapshot.agents[0].terminal_title_stripped = Some("π - 新标题 - repo".into());
++        assert_eq!(tab_label(&snapshot.tabs[0], &snapshot), "1 · 新标题");
++        snapshot.tabs[0].custom_label = true;
++        snapshot.tabs[0].label = "工作".into();
++        snapshot.tabs[0].zoomed = true;
++        assert_eq!(
++            tab_label(&snapshot.tabs[0], &snapshot),
++            "1 · 工作 · 新标题 Z"
++        );
++        snapshot.agents[0].agent = Some("claude".into());
++        snapshot.agents[0].terminal_title_stripped = Some("本地 Claude 标题".into());
++        assert_eq!(
++            tab_label(&snapshot.tabs[0], &snapshot),
++            "1 · 工作 · 本地 Claude 标题 Z"
++        );
++        snapshot.agents[0].terminal_title_stripped = Some("更新标题".into());
++        assert_eq!(
++            tab_label(&snapshot.tabs[0], &snapshot),
++            "1 · 工作 · 更新标题 Z"
++        );
++        snapshot.agents.clear();
++        assert_eq!(tab_label(&snapshot.tabs[0], &snapshot), "工作 Z");
++    }
+ 
+     #[test]
+     fn trailing_scroll_limit_accounts_for_full_widths_and_separators() {
+diff --git a/src/client/shell/tests/chrome_context.rs b/src/client/shell/tests/chrome_context.rs
+index 1ef9879..3e0d304 100644
+--- a/src/client/shell/tests/chrome_context.rs
++++ b/src/client/shell/tests/chrome_context.rs
+@@ -408,6 +408,8 @@ fn global_menu_opens_from_sidebar_and_routes_client_actions() {
+     assert!(text.contains("keybinds"));
+     assert!(text.contains("reload config"));
+     assert!(text.contains("detach"));
++    assert!(text.contains("new remote pi"));
++    assert!(text.contains("new remote codex"));
+ 
+     let keybinds = state.hits.global_menu_rows[1].0;
+     let help = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+@@ -419,8 +421,15 @@ fn global_menu_opens_from_sidebar_and_routes_client_actions() {
+     assert!(help.actions.is_empty());
+     assert!(matches!(state.overlay, Some(ClientShellOverlay::Help(_))));
+ 
++    let detach_index = global_menu::global_menu_items(&snapshot())
++        .iter()
++        .position(|(_, action)| {
++            *action
++                == global_menu::ClientGlobalMenuAction::Binding(crate::input::KeybindAction::Detach)
++        })
++        .expect("detach item");
+     state.overlay = Some(ClientShellOverlay::GlobalMenu(ClientGlobalMenuOverlay {
+-        highlighted: 3,
++        highlighted: detach_index,
+     }));
+     let detach = state.handle_input_bytes(b"\r");
+     assert!(detach.detach);
+diff --git a/src/client/shell/tests/endpoints.rs b/src/client/shell/tests/endpoints.rs
+index 5d92c45..74146a1 100644
+--- a/src/client/shell/tests/endpoints.rs
++++ b/src/client/shell/tests/endpoints.rs
+@@ -1,7 +1,11 @@
+ use super::*;
+ 
++#[path = "native_agents.rs"]
++mod native_agents;
+ #[path = "workspace_navigation.rs"]
+ mod workspace_navigation;
++#[path = "workspace_tab_endpoints.rs"]
++mod workspace_tab_endpoints;
+ use crate::client::endpoint::{
+     ClientEndpointId, ClientEndpointStatus, ProfileId, SavedSshEndpoint,
+ };
+@@ -73,6 +77,73 @@ fn state_with_remote() -> (ClientShellState, ClientEndpointId) {
+     (state, endpoint_id)
+ }
+ 
++#[test]
++fn repeated_workspace_keys_advance_before_remote_snapshot_arrives() {
++    let (mut state, remote) = state_with_remote();
++    let config: Config =
++        toml::from_str("[keys]\nnext_workspace = 'super+down'\nprevious_workspace = 'super+up'")
++            .unwrap();
++    state.config = ClientShellConfig::from_config(&config);
++    let mut projection = snapshot();
++    projection.boot_id = "remote-boot".into();
++    for number in 2..=4 {
++        let mut workspace = projection.workspaces[0].clone();
++        workspace.workspace_id = format!("ws_{number}");
++        workspace.number = number;
++        workspace.focused = false;
++        projection.workspaces.push(workspace);
++    }
++    state.set_endpoint_snapshot(&remote, Box::new(projection));
++    assert!(state.activate_endpoint_projection(&remote));
++    let mut commands = crate::client::endpoint_commands::EndpointCommands::default();
++    // No server updates between keypresses: model a slow SSH round trip.
++    for (key, expected) in [
++        (KeyCode::Down, "ws_2"),
++        (KeyCode::Down, "ws_3"),
++        (KeyCode::Up, "ws_2"),
++        (KeyCode::Down, "ws_3"),
++        (KeyCode::Down, "ws_4"),
++    ] {
++        let outcome = state.handle_raw_events(vec![RawInputEvent::Key(
++            crate::input::TerminalKey::new(key, KeyModifiers::SUPER),
++        )]);
++        assert!(
++            matches!(outcome.actions.as_slice(),
++            [ClientShellAction::Endpoint { request, .. }]
++            if matches!(&request.method, crate::api::schema::Method::WorkspaceFocus(target)
++                if target.workspace_id == expected)),
++            "expected {expected}"
++        );
++        assert!(
++            outcome.repaint,
++            "navigation should immediately repaint its selection"
++        );
++        assert_eq!(
++            state
++                .pending_workspace_highlight
++                .as_ref()
++                .unwrap()
++                .target
++                .workspace_id,
++            expected
++        );
++        for action in outcome.actions {
++            if let ClientShellAction::Endpoint {
++                endpoint_id,
++                boot_id,
++                request,
++            } = action
++            {
++                if let Some(id) = commands.enqueue(endpoint_id, 1, boot_id, request) {
++                    state.supersede_workspace_request(&id);
++                }
++            }
++        }
++        assert_eq!(state.pending_requests.len(), 1);
++        assert!(state.visible_endpoint_notice.is_none());
++    }
++}
++
+ #[test]
+ fn workspace_navigation_waits_for_the_target_presentation_fence() {
+     use crate::client::endpoint::{EndpointNegotiation, EndpointRegistry};
+diff --git a/src/client/shell/tests/mod.rs b/src/client/shell/tests/mod.rs
+index 05bfc26..50010eb 100644
+--- a/src/client/shell/tests/mod.rs
++++ b/src/client/shell/tests/mod.rs
+@@ -6,6 +6,8 @@ use crate::protocol::{
+ };
+ use crossterm::event::MouseEvent;
+ mod text_editing;
++#[path = "tab_sidebar.rs"]
++mod workspace_tabs;
+ 
+ pub(super) fn snapshot() -> ClientShellSnapshot {
+     ClientShellSnapshot {
+@@ -260,5 +262,6 @@ mod keybindings_settings;
+ mod link_hover;
+ mod mobile;
+ mod mouse_selection;
++mod new_tab_command;
+ mod popup_focus_projection;
+ mod startup_overlays;
+diff --git a/src/client/shell/tests/startup_overlays.rs b/src/client/shell/tests/startup_overlays.rs
+index bddcde1..c8012c1 100644
+--- a/src/client/shell/tests/startup_overlays.rs
++++ b/src/client/shell/tests/startup_overlays.rs
+@@ -731,7 +731,7 @@ fn update_ready_menu_opens_client_owned_release_notes_and_dismisses_by_version()
+         .join("\n");
+     assert!(text.contains("● update ready"));
+     let update_row = state.hits.global_menu_rows[3].0;
+-    assert_eq!(update_row.width, 16);
++    assert_eq!(update_row.width, 19);
+     let menu_buffer = menu.to_ratatui_buffer().expect("menu buffer");
+     assert_eq!(
+         menu_buffer[(update_row.x + 1, update_row.y)].fg,
+diff --git a/src/client/shell/worktrees.rs b/src/client/shell/worktrees.rs
+index 56c554c..c029552 100644
+--- a/src/client/shell/worktrees.rs
++++ b/src/client/shell/worktrees.rs
+@@ -530,6 +530,7 @@ impl ClientShellState {
+                 | PendingEndpointKind::ProductAnnouncementDismiss { .. }
+                 | PendingEndpointKind::ReleaseNotesDismiss
+                 | PendingEndpointKind::PopupCommand
++                | PendingEndpointKind::NewTabCommand { .. }
+                 | PendingEndpointKind::ReloadConfig
+                 | PendingEndpointKind::IntegrationList
+                 | PendingEndpointKind::IntegrationInstall
+diff --git a/src/client/shell_runtime.rs b/src/client/shell_runtime.rs
+index 52aba20..b9d2def 100644
+--- a/src/client/shell_runtime.rs
++++ b/src/client/shell_runtime.rs
+@@ -12,6 +12,31 @@ pub(super) fn dispatch_client_shell_actions(
+     let mut repaint = false;
+     for action in actions {
+         match action {
++            shell::ClientShellAction::OpenNativeAgent { launcher, args } => {
++                let result = std::env::current_exe().and_then(|exe| {
++                    std::process::Command::new(launcher)
++                        .args(args)
++                        .env("HERDR_LOCAL_CLI", exe)
++                        .env(
++                            crate::api::SOCKET_PATH_ENV_VAR,
++                            crate::session::active_api_socket_path(),
++                        )
++                        .stdin(std::process::Stdio::null())
++                        .stdout(std::process::Stdio::null())
++                        .stderr(std::process::Stdio::null())
++                        .spawn()
++                });
++                match result {
++                    Ok(child) => detached_process_children.push(child),
++                    Err(error) => {
++                        if let Some(shell) = shell.as_deref_mut() {
++                            repaint |= shell.receive_endpoint_unavailable(format!(
++                                "Could not open the native connector: {error}"
++                            ));
++                        }
++                    }
++                }
++            }
+             shell::ClientShellAction::Endpoint {
+                 endpoint_id,
+                 boot_id,
+@@ -28,7 +53,16 @@ pub(super) fn dispatch_client_shell_actions(
+                                     crate::api::schema::Method::WorkspaceFocus(_)
+                                 )))
+                 }) {
+-                    endpoint_commands.enqueue(endpoint_id, connection.generation, boot_id, request);
++                    if let Some(superseded) = endpoint_commands.enqueue(
++                        endpoint_id,
++                        connection.generation,
++                        boot_id,
++                        request,
++                    ) {
++                        if let Some(shell) = shell.as_deref_mut() {
++                            shell.supersede_workspace_request(&superseded);
++                        }
++                    }
+                 } else if let Some(shell) = shell.as_deref_mut() {
+                     repaint |= shell.cancel_endpoint_request(&request.id);
+                 }
+@@ -803,6 +837,13 @@ pub(super) fn finish_client_shell_input(
+         .is_none_or(|shell| shell.endpoint_is_online(endpoints.active_id()))
+         && endpoints.active_surface_available();
+     for request in outcome.requests {
++        if state
++            .shell
++            .as_ref()
++            .is_some_and(|shell| shell.native_editor_input(&request))
++        {
++            continue;
++        }
+         if let ClientMessage::ClientShellHostTheme { update } = &request {
+             state.record_host_theme_update(update);
+             if let Some(activation) = pending_activation.as_mut() {
+diff --git a/src/config/model.rs b/src/config/model.rs
+index 29802fd..d73f23d 100644
+--- a/src/config/model.rs
++++ b/src/config/model.rs
+@@ -964,6 +964,10 @@ pub struct UiConfig {
+     pub confirm_close: bool,
+     /// Ask for a tab name before creating a new tab. Default: true.
+     pub prompt_new_tab_name: bool,
++    /// Command to run once in the root pane of tabs created by this client. Empty disables it.
++    pub new_tab_command: String,
++    /// Offer pi / claude or an editable command before creating a tab.
++    pub prompt_new_tab_command: bool,
+     /// Ask for a workspace name before interactive creation. Default: false.
+     pub prompt_new_workspace_name: bool,
+     /// Draw borders around split panes. auto draws them only for split panes,
+@@ -1212,6 +1216,8 @@ impl Default for UiConfig {
+             mouse_scroll_lines: None,
+             confirm_close: true,
+             prompt_new_tab_name: true,
++            new_tab_command: String::new(),
++            prompt_new_tab_command: false,
+             prompt_new_workspace_name: false,
+             pane_borders: PaneBordersConfig::Auto,
+             pane_outer_borders: true,
+diff --git a/src/main.rs b/src/main.rs
+index f97e7e2..dee953c 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -287,6 +287,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+ # Ask for a tab name before creating a new tab.
+ # Set false to create tabs immediately with generated names.
+ # prompt_new_tab_name = true
++# new_tab_command = "" # e.g. "pi"; run once in each tab created by the client
+ 
+ # Ask for a workspace name before interactive creation.
+ # prompt_new_workspace_name = false
+diff --git a/src/pane.rs b/src/pane.rs
+index f80baeb..2817737 100644
+--- a/src/pane.rs
++++ b/src/pane.rs
+@@ -31,7 +31,7 @@ mod input;
+ mod kitty_keyboard;
+ mod osc;
+ mod state;
+-mod terminal;
++pub(crate) mod terminal;
+ mod xtgettcap;
+ 
+ use self::agent_detection::{
+diff --git a/src/server/client_commands.rs b/src/server/client_commands.rs
+index 97092b4..3d5861d 100644
+--- a/src/server/client_commands.rs
++++ b/src/server/client_commands.rs
+@@ -246,6 +246,10 @@ mod tests {
+         .expect("endpoint method shape fixture");
+         let mut actual = endpoint_method_shape_digests();
+         // Freeze additive methods separately without rewriting the published fixture.
++        assert_eq!(
++            actual.remove("pane.send_input").as_deref(),
++            Some("b0984bc72d68f720d07555147e6a8f14d6f7cf75376e6a3da3a393ca8f2e29a7")
++        );
+         assert_eq!(
+             actual.remove("pane.clear").as_deref(),
+             Some("0301d288ba198ddaa427dd7421c71911cccaf4ea03544531efa8b67ca21b08f6")
+diff --git a/src/client/shell/native_editor.rs b/src/client/shell/native_editor.rs
+new file mode 100644
+index 0000000..95b0697
+--- /dev/null
++++ b/src/client/shell/native_editor.rs
+@@ -0,0 +1,374 @@
++//! Client-only bridge for Pi's explicitly marked editor. No server codec changes.
++use super::*;
++use base64::Engine;
++use std::io::{BufRead, BufReader, Write};
++use std::sync::{mpsc, Arc, Mutex};
++
++const MARKER: &str = "https://herdr-native.invalid/editor/v1/";
++
++#[derive(Default)]
++pub(super) struct NativeEditors {
++    pub targets: HashMap<String, String>,
++    bridges: HashMap<String, EditorBridge>,
++    active: Option<(String, String, Rect)>,
++    endpoint: Option<ClientEndpointId>,
++}
++
++struct EditorBridge {
++    child: std::process::Child,
++    input: mpsc::Sender<String>,
++    latest: Arc<Mutex<Option<EditorFrame>>>,
++    frame: Option<FrameData>,
++    ready: bool,
++    preserve_top: bool,
++    size: (u16, u16),
++    encoder: crate::pane::terminal::GhosttyPaneTerminal,
++}
++
++#[derive(serde::Deserialize)]
++struct EditorFrame {
++    width: u16,
++    lines: Vec<String>,
++    cursor: Option<(u16, u16)>,
++    ready: bool,
++    #[serde(default)]
++    preserve_top: bool,
++}
++
++impl Drop for EditorBridge {
++    fn drop(&mut self) {
++        let _ = self.child.kill();
++        let _ = self.child.wait();
++    }
++}
++
++fn terminal(
++    cols: u16,
++    rows: u16,
++    bytes: &[u8],
++) -> Option<crate::pane::terminal::GhosttyPaneTerminal> {
++    let mut terminal = crate::ghostty::Terminal::new(cols, rows, 0).ok()?;
++    terminal.write(bytes);
++    let (sender, _) = tokio::sync::mpsc::channel(1);
++    crate::pane::terminal::GhosttyPaneTerminal::new(terminal, sender).ok()
++}
++
++fn editor_frame(frame: &EditorFrame) -> Option<FrameData> {
++    if frame.width == 0 || frame.width > 500 || frame.lines.is_empty() || frame.lines.len() > 200 {
++        return None;
++    }
++    let height = frame.lines.len() as u16;
++    let mut ansi = String::from("\x1b[?7l");
++    for (index, line) in frame.lines.iter().enumerate() {
++        if line.len() > 65536 {
++            return None;
++        }
++        ansi.push_str(&format!("\x1b[{};1H\x1b[0m{}", index + 1, line));
++    }
++    let pane = terminal(frame.width, height, ansi.as_bytes())?;
++    let mut renderer =
++        ratatui::Terminal::new(ratatui::backend::TestBackend::new(frame.width, height)).ok()?;
++    renderer
++        .draw(|view| pane.render(view, Rect::new(0, 0, frame.width, height), false))
++        .ok()?;
++    let mut output =
++        FrameData::from_ratatui_buffer_with_hyperlinks(renderer.backend().buffer(), None, &[]);
++    if let Some((x, y)) = frame
++        .cursor
++        .filter(|(x, y)| *x < frame.width && *y < height)
++    {
++        output.cursor = Some(crate::protocol::CursorState {
++            x,
++            y,
++            visible: true,
++            shape: 2,
++        });
++    }
++    Some(output)
++}
++
++impl EditorBridge {
++    fn spawn(launcher: &str, machine: &str, socket: &str, cwd: &str) -> Option<Self> {
++        let mut command = std::process::Command::new(launcher);
++        command.args(["editor", "--socket", socket, "--cwd", cwd]);
++        if machine.is_empty() {
++            command.arg("--local");
++        } else {
++            command.args(["--host", machine]);
++        }
++        let mut child = command
++            .stdin(std::process::Stdio::piped())
++            .stdout(std::process::Stdio::piped())
++            .stderr(std::process::Stdio::null())
++            .spawn()
++            .ok()?;
++        let mut stdin = child.stdin.take()?;
++        let stdout = child.stdout.take()?;
++        let (input, receiver) = mpsc::channel::<String>();
++        std::thread::spawn(move || {
++            for line in receiver {
++                if writeln!(stdin, "{line}").is_err() || stdin.flush().is_err() {
++                    break;
++                }
++            }
++        });
++        let latest = Arc::new(Mutex::new(None));
++        let frames = latest.clone();
++        std::thread::spawn(move || {
++            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
++                if line.len() > 4 * 1024 * 1024 {
++                    break;
++                }
++                if let Ok(frame) = serde_json::from_str::<EditorFrame>(&line) {
++                    if let Ok(mut slot) = frames.lock() {
++                        *slot = Some(frame);
++                    }
++                }
++            }
++        });
++        Some(Self {
++            child,
++            input,
++            latest,
++            frame: None,
++            ready: false,
++            preserve_top: false,
++            size: (0, 0),
++            encoder: terminal(1, 1, b"\x1b[>1u")?,
++        })
++    }
++    fn send(&self, value: serde_json::Value) -> bool {
++        self.input.send(value.to_string()).is_ok()
++    }
++    fn poll(&mut self, width: u16, height: u16) -> bool {
++        if self.size != (width, height) {
++            self.size = (width, height);
++            self.send(serde_json::json!({"type":"size", "width":width, "height":height}));
++        }
++        let update = self.latest.lock().ok().and_then(|mut slot| slot.take());
++        if let Some(update) = update {
++            if let Some(frame) = editor_frame(&update) {
++                self.frame = Some(frame);
++                self.ready = update.ready;
++                self.preserve_top = update.preserve_top;
++                return true;
++            }
++        }
++        false
++    }
++}
++
++impl NativeEditors {
++    pub fn active(&self) -> bool {
++        self.active.is_some()
++    }
++
++    fn sync(
++        &mut self,
++        endpoint: &ClientEndpointId,
++        snapshot: &ClientShellSnapshot,
++        surface: &PaneSurfaceFrame,
++    ) -> bool {
++        self.active = None;
++        self.endpoint = Some(endpoint.clone());
++        let machine = match endpoint {
++            ClientEndpointId::Local => "",
++            ClientEndpointId::Ssh(profile) => {
++                let Some(machine) = self.targets.get(&profile.to_string()) else {
++                    return false;
++                };
++                machine.as_str()
++            }
++            _ => return false,
++        };
++        if surface.popup.is_some() {
++            return false;
++        }
++        let Some(pane) = surface.panes.iter().find(|pane| pane.focused) else {
++            return false;
++        };
++        if pane
++            .scroll
++            .is_some_and(|scroll| scroll.offset_from_bottom > 0)
++        {
++            return false;
++        }
++        let bounds = pane.inner_rect;
++        let mut marked = None;
++        // Parse only explicitly marked hyperlinks and only the focused pane's rows.
++        for (link, uri) in surface.frame.hyperlinks.iter().enumerate() {
++            let Some(encoded) = uri.strip_prefix(MARKER) else {
++                continue;
++            };
++            let Some(socket) = base64::engine::general_purpose::URL_SAFE_NO_PAD
++                .decode(encoded)
++                .ok()
++                .and_then(|bytes| String::from_utf8(bytes).ok())
++            else {
++                continue;
++            };
++            if !socket.starts_with("/tmp/hn-editor-")
++                || !socket.ends_with("/editor.sock")
++                || socket.contains("..")
++            {
++                continue;
++            }
++            let mut first = None;
++            let mut last = 0;
++            for y in bounds.y..bounds.y.saturating_add(bounds.height) {
++                let start =
++                    usize::from(y) * usize::from(surface.frame.width) + usize::from(bounds.x);
++                let end = start + usize::from(bounds.width);
++                if surface
++                    .frame
++                    .cells
++                    .get(start..end)
++                    .is_some_and(|row| row.iter().any(|cell| cell.hyperlink == Some(link as u32)))
++                {
++                    first.get_or_insert(y);
++                    last = y;
++                }
++            }
++            if let Some(first) = first {
++                marked = Some((
++                    socket,
++                    Rect::new(bounds.x, first, bounds.width, last - first + 1),
++                ));
++                break;
++            }
++        }
++        let Some((socket, rect)) = marked else {
++            return false;
++        };
++        let key = format!("{machine}:{socket}");
++        if !self.bridges.contains_key(&key) {
++            // Automatic Claude handoffs create a fresh socket per prompt. Reap
++            // completed editors only on a new handoff, never once per frame.
++            self.bridges
++                .retain(|_, bridge| !matches!(bridge.child.try_wait(), Ok(Some(_))));
++            let Ok(launcher) = std::env::var("HERDR_REMOTE_LAUNCHER") else {
++                return false;
++            };
++            let cwd = snapshot
++                .panes
++                .iter()
++                .find(|entry| entry.pane_id == pane.pane_id)
++                .and_then(|entry| entry.foreground_cwd.as_deref().or(entry.cwd.as_deref()))
++                .unwrap_or("/");
++            let Some(bridge) = EditorBridge::spawn(&launcher, machine, &socket, cwd) else {
++                return false;
++            };
++            self.bridges.insert(key.clone(), bridge);
++        }
++        self.active = Some((key.clone(), pane.pane_id.clone(), rect));
++        self.bridges
++            .get_mut(&key)
++            .is_some_and(|bridge| bridge.poll(rect.width, bounds.height))
++    }
++
++    pub fn intercept(&self, request: &ClientMessage) -> bool {
++        let Some((key, pane, _)) = &self.active else {
++            return false;
++        };
++        let Some(bridge) = self.bridges.get(key).filter(|bridge| bridge.ready) else {
++            return false;
++        };
++        let ClientMessage::ClientShellPaneInput { pane_id, events } = request else {
++            return false;
++        };
++        if pane_id != pane
++            || events
++                .iter()
++                .any(|event| matches!(event, ClientPaneInputEvent::Mouse { .. }))
++        {
++            return false;
++        }
++        for event in events {
++            let bytes = match event.to_raw_input_event() {
++                crate::raw_input::RawInputEvent::Key(key) => {
++                    bridge.encoder.encode_terminal_key(key)
++                }
++                crate::raw_input::RawInputEvent::Paste(text) => {
++                    format!("\x1b[200~{text}\x1b[201~").into_bytes()
++                }
++                crate::raw_input::RawInputEvent::Text(text) => text.into_string().into_bytes(),
++                _ => continue,
++            };
++            bridge
++                .send(serde_json::json!({"type":"input", "data":String::from_utf8_lossy(&bytes)}));
++        }
++        true
++    }
++
++    pub fn blit(&self, frame: &mut FrameData, origin: Rect) {
++        let Some((key, _, rect)) = &self.active else {
++            return;
++        };
++        let Some(source) = self
++            .bridges
++            .get(key)
++            .filter(|bridge| bridge.ready)
++            .and_then(|bridge| bridge.frame.as_ref())
++        else {
++            return;
++        };
++        if source.width != rect.width || source.height > rect.bottom() {
++            return;
++        }
++        let x = origin.x + rect.x;
++        let y = origin.y + rect.bottom() - source.height;
++        if x + source.width > frame.width || y + source.height > frame.height {
++            return;
++        }
++        let top_start = usize::from(origin.y + rect.y) * usize::from(frame.width) + usize::from(x);
++        let original_top = frame
++            .cells
++            .get(top_start..top_start + usize::from(source.width))
++            .map(|row| row.to_vec());
++        for row in 0..source.height {
++            let dst = usize::from(y + row) * usize::from(frame.width) + usize::from(x);
++            let src = usize::from(row) * usize::from(source.width);
++            frame.cells[dst..dst + usize::from(source.width)]
++                .clone_from_slice(&source.cells[src..src + usize::from(source.width)]);
++        }
++        if let Some(top) = original_top.filter(|_| {
++            self.bridges
++                .get(key)
++                .is_some_and(|bridge| bridge.preserve_top)
++        }) {
++            let start = usize::from(y) * usize::from(frame.width) + usize::from(x);
++            frame.cells[start..start + top.len()].clone_from_slice(&top);
++        }
++        frame.cursor = source.cursor.clone().map(|mut cursor| {
++            cursor.x += x;
++            cursor.y += y;
++            cursor
++        });
++    }
++}
++
++impl ClientShellState {
++    pub(crate) fn tick_native_editor(&mut self) -> bool {
++        if self.pane_surface_generation != self.active_snapshot_generation {
++            self.native_editors.active = None;
++            return false;
++        }
++        match (self.snapshot.as_deref(), self.pane_surface.as_ref()) {
++            (Some(snapshot), Some(surface)) if snapshot.revision == surface.projection_revision => {
++                self.native_editors
++                    .sync(&self.active_endpoint_id, snapshot, surface)
++            }
++            _ => {
++                self.native_editors.active = None;
++                false
++            }
++        }
++    }
++    pub(crate) fn native_editor_input(&self, request: &ClientMessage) -> bool {
++        self.mode == ClientShellMode::Terminal
++            && self.overlay.is_none()
++            && self.native_editors.endpoint.as_ref() == Some(&self.active_endpoint_id)
++            && self.pane_surface.is_some()
++            && self.native_editors.intercept(request)
++    }
++}
+diff --git a/src/client/shell/native_tab_groups.rs b/src/client/shell/native_tab_groups.rs
+new file mode 100644
+index 0000000..e1968f3
+--- /dev/null
++++ b/src/client/shell/native_tab_groups.rs
+@@ -0,0 +1,564 @@
++//! Native split surfaces are independent Herdr clients, not server pane splits.
++//! Only tab ownership is shared between them; terminal/tab identities stay intact.
++use super::*;
++use crossterm::event::KeyModifiers;
++use std::{
++    collections::BTreeMap,
++    path::PathBuf,
++    time::{Duration, Instant},
++};
++
++pub(super) struct NativeTabGroup {
++    root: PathBuf,
++    id: String,
++    boot: String,
++    owners: BTreeMap<String, String>,
++    next_poll: Instant,
++    focus_retry: Instant,
++    had_tabs: bool,
++    empty_since: Option<Instant>,
++}
++
++impl NativeTabGroup {
++    pub(super) fn from_env() -> Option<Self> {
++        let root = std::env::var_os("HERDR_NATIVE_GROUP_ROOT")?;
++        let id = std::env::var("HERDR_NATIVE_GROUP_ID").unwrap_or_else(|_| "main".into());
++        Some(Self {
++            root: root.into(),
++            id,
++            boot: String::new(),
++            owners: BTreeMap::new(),
++            next_poll: Instant::now(),
++            focus_retry: Instant::now(),
++            had_tabs: false,
++            empty_since: None,
++        })
++    }
++
++    fn owns(&self, tab: &str) -> bool {
++        self.owners
++            .get(tab)
++            .map_or(self.id == "main", |owner| owner == &self.id)
++    }
++
++    fn claim(&mut self, boot: &str, tab: &str) -> std::io::Result<()> {
++        if !safe_component(boot) || !safe_component(tab) {
++            return Err(std::io::Error::other("invalid tab identity"));
++        }
++        let directory = self.root.join(boot);
++        std::fs::create_dir_all(&directory)?;
++        let temporary = directory.join(format!(".{}-{}", tab, std::process::id()));
++        std::fs::write(&temporary, &self.id)?;
++        std::fs::rename(temporary, directory.join(tab))?;
++        self.next_poll = Instant::now();
++        Ok(())
++    }
++
++    fn poll(&mut self, boot: &str, now: Instant) -> bool {
++        if now < self.next_poll && boot == self.boot {
++            return false;
++        }
++        self.next_poll = now + Duration::from_millis(250);
++        if !safe_component(boot) {
++            return false;
++        }
++        if boot != self.boot {
++            let _ = std::fs::create_dir_all(self.root.join(boot));
++        }
++        let mut owners = BTreeMap::new();
++        if let Ok(entries) = std::fs::read_dir(self.root.join(boot)) {
++            for entry in entries.flatten() {
++                let name = entry.file_name().to_string_lossy().into_owned();
++                if name.starts_with('.') {
++                    continue;
++                }
++                if let Ok(owner) = std::fs::read_to_string(entry.path()) {
++                    owners.insert(name, owner);
++                }
++            }
++        }
++        let changed = owners != self.owners || boot != self.boot;
++        self.owners = owners;
++        self.boot = boot.to_owned();
++        changed
++    }
++}
++
++fn safe_component(value: &str) -> bool {
++    !value.is_empty()
++        && value
++            .bytes()
++            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b':'))
++}
++
++impl Drop for NativeTabGroup {
++    fn drop(&mut self) {
++        // Closing a split detaches only its client. Return its tabs to the main group.
++        let _ = std::fs::remove_file(self.root.join(format!("surface-{}", self.id)));
++        if self.id == "main" || !safe_component(&self.boot) {
++            return;
++        }
++        if let Ok(entries) = std::fs::read_dir(self.root.join(&self.boot)) {
++            for entry in entries.flatten() {
++                if std::fs::read_to_string(entry.path()).ok().as_deref() == Some(&self.id) {
++                    let _ = std::fs::write(entry.path(), "main");
++                }
++            }
++        }
++    }
++}
++
++impl ClientShellState {
++    pub(super) fn native_group_surface_ready(&self) -> bool {
++        if self.active_endpoint_id != ClientEndpointId::Local {
++            return true;
++        }
++        let (Some(group), Some(snapshot)) = (&self.native_tab_group, &self.snapshot) else {
++            return true;
++        };
++        snapshot
++            .focused_tab_id
++            .as_deref()
++            .is_some_and(|tab| group.owns(tab))
++            && snapshot
++                .tabs
++                .iter()
++                .any(|tab| Some(&tab.tab_id) == snapshot.focused_tab_id.as_ref())
++    }
++
++    pub(super) fn filter_native_group_snapshot(&self, snapshot: &mut ClientShellSnapshot) {
++        if self.active_endpoint_id != ClientEndpointId::Local {
++            return;
++        }
++        let Some(group) = self.native_tab_group.as_ref() else {
++            return;
++        };
++        snapshot.tabs.retain(|tab| group.owns(&tab.tab_id));
++        // Keep workspace metadata so an empty group can still create a tab.
++        // Pane metadata remains intact for server surface identity validation.
++    }
++
++    pub(super) fn claim_native_group_tab(&mut self, boot: &str, tab: &str) {
++        if self.active_endpoint_id != ClientEndpointId::Local {
++            return;
++        }
++        if let Some(group) = &mut self.native_tab_group {
++            if let Err(error) = group.claim(boot, tab) {
++                self.set_endpoint_error(format!("Could not assign tab to this group: {error}"));
++            }
++        }
++    }
++
++    pub(super) fn native_split_key(
++        &mut self,
++        key: &crate::input::TerminalKey,
++        outcome: &mut ClientShellInput,
++    ) -> bool {
++        if self.native_tab_group.is_none() {
++            return false;
++        }
++        if matches!(key.code, KeyCode::Modifier(_)) {
++            return false;
++        }
++        if let Some((_, tab)) = self.native_split_chord.take() {
++            let direction = match key.code {
++                KeyCode::Left => Some("left"),
++                KeyCode::Right => Some("right"),
++                KeyCode::Up => Some("up"),
++                KeyCode::Down => Some("down"),
++                KeyCode::Esc => return true,
++                _ => None,
++            };
++            self.split_native_tab_group_for(Some(&tab), direction.unwrap_or("right"), outcome);
++            if direction.is_some() {
++                return true;
++            }
++        }
++        if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL {
++            if let Some(tab) = self
++                .snapshot
++                .as_ref()
++                .and_then(|s| s.focused_tab_id.clone())
++            {
++                self.native_split_chord = Some((Instant::now() + Duration::from_millis(450), tab));
++            }
++            return true;
++        }
++        false
++    }
++
++    pub(super) fn move_native_tab_drop(
++        &mut self,
++        tab: &str,
++        outcome: &mut ClientShellInput,
++    ) -> bool {
++        let Some(group) = &self.native_tab_group else {
++            return false;
++        };
++        if self.active_endpoint_id != ClientEndpointId::Local {
++            return false;
++        }
++        let Ok(record) = std::fs::read_to_string(group.root.join("drop-surface")) else {
++            return false;
++        };
++        let Some((time, surface)) = record.split_once('\n') else {
++            return false;
++        };
++        let Ok(time) = time.parse::<f64>() else {
++            return false;
++        };
++        let now = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map_or(0.0, |d| d.as_secs_f64());
++        if !(0.0..2.0).contains(&(now - time)) {
++            return false;
++        }
++        let Ok(entries) = std::fs::read_dir(&group.root) else {
++            return false;
++        };
++        let target = entries.flatten().find_map(|entry| {
++            let name = entry.file_name().to_string_lossy().into_owned();
++            let id = name.strip_prefix("surface-")?;
++            if id == group.id || !safe_component(id) {
++                return None;
++            }
++            (std::fs::read_to_string(entry.path()).ok()?.trim() == surface.trim())
++                .then(|| id.to_owned())
++        });
++        let Some(target) = target else {
++            return false;
++        };
++        self.launch_native_tab_group(Some(tab), "right", Some(&target), outcome)
++    }
++
++    pub(super) fn split_native_tab_group_for(
++        &mut self,
++        tab_id: Option<&str>,
++        direction: &str,
++        outcome: &mut ClientShellInput,
++    ) -> bool {
++        self.launch_native_tab_group(tab_id, direction, None, outcome)
++    }
++
++    fn launch_native_tab_group(
++        &mut self,
++        tab_id: Option<&str>,
++        direction: &str,
++        target: Option<&str>,
++        outcome: &mut ClientShellInput,
++    ) -> bool {
++        let Some(group) = &self.native_tab_group else {
++            return false;
++        };
++        if self.active_endpoint_id != ClientEndpointId::Local {
++            self.set_endpoint_error("Native tab groups currently support Local tabs only");
++            outcome.repaint = true;
++            return true;
++        }
++        let Some(snapshot) = self.snapshot.as_deref() else {
++            return true;
++        };
++        let Some(selected) = snapshot
++            .tabs
++            .iter()
++            .find(|t| Some(t.tab_id.as_str()) == tab_id.or(snapshot.focused_tab_id.as_deref()))
++        else {
++            return true;
++        };
++        let tab = &selected.tab_id;
++        let workspace = &selected.workspace_id;
++        let Some(helper) = std::env::var_os("HERDR_NATIVE_GROUP_LAUNCHER") else {
++            self.set_endpoint_error("Native tab group launcher is not installed");
++            outcome.repaint = true;
++            return true;
++        };
++        let tabs: Vec<_> = snapshot
++            .tabs
++            .iter()
++            .filter(|t| &t.workspace_id == workspace)
++            .collect();
++        let index = tabs.iter().position(|t| &t.tab_id == tab).unwrap_or(0);
++        let previous = if tabs.len() > 1 {
++            tabs[if index > 0 { index - 1 } else { 1 }].tab_id.clone()
++        } else {
++            String::new()
++        };
++        let mut args = vec![
++            helper.to_string_lossy().into_owned(),
++            "--root".into(),
++            group.root.display().to_string(),
++            "--group".into(),
++            group.id.clone(),
++            "--boot".into(),
++            snapshot.boot_id.clone(),
++            "--tab".into(),
++            tab.clone(),
++            "--workspace".into(),
++            workspace.clone(),
++            "--previous".into(),
++            previous,
++            "--direction".into(),
++            direction.into(),
++        ];
++        if let Some(target) = target {
++            args.extend(["--target-group".into(), target.into()]);
++        }
++        outcome.actions.push(ClientShellAction::OpenNativeAgent {
++            launcher: "/usr/bin/python3".into(),
++            args,
++        });
++        true
++    }
++
++    pub(crate) fn tick_native_tab_groups(&mut self, now: Instant, outcome: &mut ClientShellInput) {
++        if self
++            .native_split_chord
++            .as_ref()
++            .is_some_and(|(deadline, _)| now >= *deadline)
++        {
++            if let Some((_, tab)) = self.native_split_chord.take() {
++                if self.overlay.is_none() && self.mode == ClientShellMode::Terminal {
++                    self.split_native_tab_group_for(Some(&tab), "right", outcome);
++                }
++            }
++        }
++        if self.active_endpoint_id != ClientEndpointId::Local || self.native_tab_group.is_none() {
++            return;
++        }
++        if let Some(group) = &self.native_tab_group {
++            // Ownership and focus mailboxes are client-local, polled at 4 Hz,
++            // never once per rendered frame or once per pane.
++            if now < group.next_poll {
++                return;
++            }
++            if now >= group.next_poll {
++                let path = group.root.join(format!("error-{}", group.id));
++                if let Ok(error) = std::fs::read_to_string(&path) {
++                    let _ = std::fs::remove_file(path);
++                    self.set_endpoint_error(format!("Could not split tab group: {error}"));
++                    outcome.repaint = true;
++                }
++            }
++        }
++        let Some(endpoint) = self
++            .endpoints
++            .iter()
++            .find(|e| e.endpoint_id == ClientEndpointId::Local)
++        else {
++            return;
++        };
++        let Some(raw) = endpoint.snapshot.as_ref() else {
++            return;
++        };
++        let generation = endpoint.snapshot_generation;
++        let Some(group) = self.native_tab_group.as_mut() else {
++            return;
++        };
++        let changed = group.poll(&raw.boot_id, now);
++        if changed {
++            let raw = raw.clone();
++            self.apply_active_snapshot(raw, generation);
++            outcome.repaint = true;
++        }
++        if self
++            .pending_requests
++            .values()
++            .any(|request| request.method_name == "tab.create")
++        {
++            return;
++        }
++        let Some(snapshot) = self.snapshot.as_deref() else {
++            return;
++        };
++        let Some(group) = self.native_tab_group.as_mut() else {
++            return;
++        };
++        if snapshot.tabs.is_empty() && group.had_tabs {
++            // Never show another group's live surface after closing our last tab.
++            // A normal detach closes just this native split, not its server.
++            let since = group.empty_since.get_or_insert(now);
++            outcome.detach = now.duration_since(*since) >= Duration::from_secs(1);
++            return;
++        }
++        group.empty_since = None;
++        group.had_tabs |= !snapshot.tabs.is_empty();
++        let focus_path = group.root.join(format!("focus-{}", group.id));
++        let preferred = std::fs::read_to_string(&focus_path).ok();
++        if snapshot
++            .focused_tab_id
++            .as_deref()
++            .is_some_and(|tab| group.owns(tab))
++            && preferred.as_ref().is_none_or(|id| {
++                snapshot.focused_tab_id.as_ref() == Some(id)
++                    || !snapshot.tabs.iter().any(|t| &t.tab_id == id)
++            })
++        {
++            if preferred.as_ref() == snapshot.focused_tab_id.as_ref() {
++                let _ = std::fs::remove_file(&focus_path);
++            }
++            return;
++        }
++        if now < group.focus_retry {
++            return;
++        }
++        let target = preferred
++            .as_ref()
++            .and_then(|id| snapshot.tabs.iter().find(|t| &t.tab_id == id))
++            .or_else(|| {
++                snapshot
++                    .tabs
++                    .iter()
++                    .find(|t| Some(&t.workspace_id) == snapshot.focused_workspace_id.as_ref())
++            })
++            .or_else(|| snapshot.tabs.first())
++            .map(|tab| tab.tab_id.clone());
++        if let Some(tab_id) = target {
++            group.focus_retry = now + Duration::from_secs(1);
++            self.push_endpoint_method(
++                crate::api::schema::Method::TabFocus(crate::api::schema::TabTarget { tab_id }),
++                outcome,
++            );
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn split_test_state() -> ClientShellState {
++        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
++        state.snapshot = Some(Box::new(super::super::tests::snapshot()));
++        state.native_tab_group = Some(NativeTabGroup {
++            root: PathBuf::new(),
++            id: "main".into(),
++            boot: String::new(),
++            owners: BTreeMap::new(),
++            next_poll: Instant::now(),
++            focus_retry: Instant::now(),
++            had_tabs: false,
++            empty_since: None,
++        });
++        state
++    }
++
++    #[test]
++    fn native_tab_group_chord_captures_tab_and_escape_cancels() {
++        let mut state = split_test_state();
++        let mut outcome = ClientShellInput::default();
++        let ctrl_d = crate::input::TerminalKey::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
++        assert!(state.native_split_key(&ctrl_d, &mut outcome));
++        assert_eq!(state.native_split_chord.as_ref().unwrap().1, "tab_1");
++        assert!(outcome.actions.is_empty());
++        assert!(state.native_split_key(
++            &crate::input::TerminalKey::new(KeyCode::Esc, KeyModifiers::NONE),
++            &mut outcome
++        ));
++        assert!(state.native_split_chord.is_none());
++        assert!(outcome.actions.is_empty());
++    }
++
++    #[test]
++    fn native_tab_group_chord_consumes_all_four_arrows() {
++        for code in [KeyCode::Left, KeyCode::Right, KeyCode::Up, KeyCode::Down] {
++            for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
++                let mut state = split_test_state();
++                state.native_split_chord = Some((Instant::now(), "tab_1".into()));
++                assert!(state.native_split_key(
++                    &crate::input::TerminalKey::new(code, modifiers),
++                    &mut ClientShellInput::default()
++                ));
++                assert!(state.native_split_chord.is_none());
++            }
++        }
++    }
++
++    #[test]
++    fn native_tab_group_chord_does_not_capture_other_keys_or_non_native_clients() {
++        let mut state = split_test_state();
++        let mut outcome = ClientShellInput::default();
++        assert!(!state.native_split_key(
++            &crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::NONE),
++            &mut outcome
++        ));
++        state.native_tab_group = None;
++        assert!(!state.native_split_key(
++            &crate::input::TerminalKey::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
++            &mut outcome
++        ));
++        assert!(state.native_split_chord.is_none());
++    }
++
++    #[test]
++    fn native_tab_group_unassigned_tabs_belong_only_to_main() {
++        let mut group = NativeTabGroup {
++            root: PathBuf::new(),
++            id: "main".into(),
++            boot: String::new(),
++            owners: BTreeMap::new(),
++            next_poll: Instant::now(),
++            focus_retry: Instant::now(),
++            had_tabs: false,
++            empty_since: None,
++        };
++        assert!(group.owns("w1:t1"));
++        group.owners.insert("w1:t2".into(), "right".into());
++        assert!(!group.owns("w1:t2"));
++        group.id = "right".into();
++        assert!(group.owns("w1:t2"));
++        assert!(!group.owns("w1:t1"));
++    }
++    #[test]
++    fn native_tab_group_blocks_foreign_surface_input_during_focus_handoff() {
++        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
++        state.snapshot = Some(Box::new(super::super::tests::snapshot()));
++        state.native_tab_group = Some(NativeTabGroup {
++            root: PathBuf::new(),
++            id: "right".into(),
++            boot: String::new(),
++            owners: BTreeMap::new(),
++            next_poll: Instant::now(),
++            focus_retry: Instant::now(),
++            had_tabs: false,
++            empty_since: None,
++        });
++        assert!(!state.native_group_surface_ready());
++        let input = state.handle_input_bytes(b"do-not-send\r");
++        assert!(input.requests.is_empty());
++        assert!(input.actions.is_empty());
++        state
++            .native_tab_group
++            .as_mut()
++            .unwrap()
++            .owners
++            .insert("tab_1".into(), "right".into());
++        assert!(state.native_group_surface_ready());
++    }
++
++    #[test]
++    fn native_tab_group_claim_poll_and_detach_preserve_membership() {
++        let temp =
++            std::env::temp_dir().join(format!("herdr-tab-group-test-{}", std::process::id()));
++        let mut group = NativeTabGroup {
++            root: temp.clone(),
++            id: "right".into(),
++            boot: "boot".into(),
++            owners: BTreeMap::new(),
++            next_poll: Instant::now(),
++            focus_retry: Instant::now(),
++            had_tabs: false,
++            empty_since: None,
++        };
++        group.claim("boot", "w1:t2").unwrap();
++        group.poll("boot", Instant::now());
++        assert!(group.owns("w1:t2"));
++        assert!(!group.owns("w1:t1"));
++        assert!(group.claim("../bad", "w1:t2").is_err());
++        drop(group);
++        assert_eq!(
++            std::fs::read_to_string(temp.join("boot/w1:t2")).unwrap(),
++            "main"
++        );
++        std::fs::remove_dir_all(temp).unwrap();
++    }
++}
+diff --git a/src/client/shell/remote_agents.rs b/src/client/shell/remote_agents.rs
+new file mode 100644
+index 0000000..2b326f7
+--- /dev/null
++++ b/src/client/shell/remote_agents.rs
+@@ -0,0 +1,95 @@
++use super::*;
++
++// Client presentation only: the connector uses the existing public JSON CLI/API,
++// including operations that older servers do not expose on the TUI endpoint.
++impl ClientShellState {
++    pub(super) fn begin_native_agent(&mut self, agent: &str, outcome: &mut ClientShellInput) {
++        let Ok(launcher) = std::env::var("HERDR_REMOTE_LAUNCHER") else {
++            self.set_endpoint_error("Open Herdr Native to use local remote-agent editing");
++            outcome.repaint = true;
++            return;
++        };
++        self.prepare_native_agent(agent, &launcher, outcome);
++    }
++
++    pub(super) fn prepare_native_agent(
++        &mut self,
++        agent: &str,
++        launcher: &str,
++        outcome: &mut ClientShellInput,
++    ) {
++        if agent == "pi" || agent == "claude" {
++            let remote = if !self.active_endpoint_id.is_local() {
++                Some(self.active_endpoint_id.clone())
++            } else {
++                let candidates = self
++                    .endpoints
++                    .iter()
++                    .filter(|endpoint| {
++                        !endpoint.endpoint_id.is_local()
++                            && endpoint.status == ClientEndpointStatus::Online
++                    })
++                    .collect::<Vec<_>>();
++                (candidates.len() == 1).then(|| candidates[0].endpoint_id.clone())
++            };
++            let Some(ClientEndpointId::Ssh(profile)) = remote else {
++                self.set_endpoint_error("Select the remote machine for this agent first");
++                outcome.repaint = true;
++                return;
++            };
++            let mut args = vec![
++                "open".into(),
++                "--agent".into(),
++                agent.into(),
++                "--machine".into(),
++                profile.to_string(),
++            ];
++            if self.active_endpoint_id == ClientEndpointId::Ssh(profile.clone()) {
++                if let Some(cwd) = self.snapshot.as_deref().and_then(|snapshot| {
++                    snapshot
++                        .panes
++                        .iter()
++                        .find(|pane| Some(&pane.pane_id) == snapshot.focused_pane_id.as_ref())
++                        .and_then(|pane| pane.foreground_cwd.as_ref().or(pane.cwd.as_ref()))
++                }) {
++                    args.extend(["--cwd".into(), cwd.clone()]);
++                }
++            }
++            self.activate_endpoint(ClientEndpointId::Ssh(profile), outcome);
++            outcome.actions.push(ClientShellAction::OpenNativeAgent {
++                launcher: launcher.into(),
++                args,
++            });
++            outcome.repaint = true;
++            return;
++        }
++        if !self.endpoint_is_online(&ClientEndpointId::Local) {
++            self.set_endpoint_error(
++                "Local endpoint is not ready; remote sessions were not changed",
++            );
++            outcome.repaint = true;
++            return;
++        }
++        let mut args = vec!["open".into(), "--agent".into(), agent.into()];
++        if let ClientEndpointId::Ssh(profile) = &self.active_endpoint_id {
++            args.extend(["--machine".into(), profile.to_string()]);
++            if let Some(cwd) = self.snapshot.as_deref().and_then(|snapshot| {
++                snapshot
++                    .panes
++                    .iter()
++                    .find(|pane| Some(&pane.pane_id) == snapshot.focused_pane_id.as_ref())
++                    .and_then(|pane| pane.foreground_cwd.as_ref().or(pane.cwd.as_ref()))
++            }) {
++                args.extend(["--cwd".into(), cwd.clone()]);
++            }
++        }
++        // Use the regular source-off-first endpoint handoff. Never send commands to
++        // whichever remote pane happened to have focus when this action was clicked.
++        self.activate_endpoint(ClientEndpointId::Local, outcome);
++        outcome.actions.push(ClientShellAction::OpenNativeAgent {
++            launcher: launcher.into(),
++            args,
++        });
++        outcome.repaint = true;
++    }
++}
+diff --git a/src/client/shell/tab_sidebar.rs b/src/client/shell/tab_sidebar.rs
+new file mode 100644
+index 0000000..412da71
+--- /dev/null
++++ b/src/client/shell/tab_sidebar.rs
+@@ -0,0 +1,160 @@
++use ratatui::{
++    text::Line,
++    widgets::{Paragraph, Widget},
++};
++
++use super::*;
++
++pub(super) struct TabSidebarRow {
++    pub endpoint_id: Option<ClientEndpointId>,
++    pub pane_id: Option<String>,
++    label: String,
++    status: Option<crate::api::schema::AgentStatus>,
++    focused: bool,
++    stale: bool,
++}
++
++pub(super) fn append_rows(
++    rows: &mut Vec<TabSidebarRow>,
++    snapshot: &ClientShellSnapshot,
++    endpoint: Option<&ClientShellEndpoint>,
++    active: bool,
++) {
++    let endpoint_id = endpoint.map(|endpoint| endpoint.endpoint_id.clone());
++    let stale = endpoint.is_some_and(|endpoint| endpoint.status != ClientEndpointStatus::Online);
++    for workspace in &snapshot.workspaces {
++        let tabs = snapshot
++            .tabs
++            .iter()
++            .filter(|tab| tab.workspace_id == workspace.workspace_id);
++        let mut group = Vec::new();
++        for tab in tabs {
++            let pane = snapshot
++                .panes
++                .iter()
++                .filter(|pane| {
++                    pane.workspace_id == workspace.workspace_id && pane.tab_id == tab.tab_id
++                })
++                .max_by_key(|pane| pane.focused);
++            group.push(TabSidebarRow {
++                endpoint_id: endpoint_id.clone(),
++                pane_id: pane.map(|pane| pane.pane_id.clone()),
++                label: super::render::tab_label(tab, snapshot),
++                status: Some(tab.agent_status),
++                focused: active && workspace.focused && tab.focused,
++                stale,
++            });
++        }
++        if group.is_empty() {
++            continue;
++        }
++        rows.push(TabSidebarRow {
++            endpoint_id: endpoint_id.clone(),
++            pane_id: None,
++            label: endpoint.map_or_else(
++                || format!(" {}", workspace.label),
++                |endpoint| format!(" {} · {}", endpoint.label, workspace.label),
++            ),
++            status: None,
++            focused: false,
++            stale,
++        });
++        rows.extend(group);
++    }
++}
++
++pub(super) fn endpoint_rows(
++    endpoints: &[ClientShellEndpoint],
++    active_endpoint_id: &ClientEndpointId,
++) -> Vec<TabSidebarRow> {
++    let mut rows = Vec::new();
++    for endpoint in endpoints {
++        if let Some(snapshot) = endpoint.snapshot.as_deref() {
++            append_rows(
++                &mut rows,
++                snapshot,
++                Some(endpoint),
++                &endpoint.endpoint_id == active_endpoint_id,
++            );
++        }
++    }
++    rows
++}
++
++pub(super) fn render(
++    buffer: &mut Buffer,
++    area: Rect,
++    rows: &[TabSidebarRow],
++    config: &ClientShellConfig,
++    scroll: &mut usize,
++    hits: &mut ShellHitMap,
++) {
++    if area.height < 2 {
++        return;
++    }
++    Paragraph::new("─".repeat(area.width as usize))
++        .style(Style::default().fg(config.palette.surface_dim))
++        .render(Rect::new(area.x, area.y, area.width, 1), buffer);
++    Paragraph::new(" tabs · workspaces")
++        .style(
++            Style::default()
++                .fg(config.palette.overlay0)
++                .add_modifier(Modifier::BOLD),
++        )
++        .render(Rect::new(area.x, area.y + 1, area.width, 1), buffer);
++    hits.agent_sort_toggle = Rect::default();
++    super::agent_sidebar::render_agent_list(
++        buffer,
++        area,
++        rows,
++        Some(" no tabs"),
++        config,
++        scroll,
++        hits,
++        0,
++        |_| 1,
++        |buffer, rect, row, hits| {
++            let mut style = Style::default().fg(config.palette.subtext0);
++            if row.focused {
++                style = style
++                    .bg(config.palette.active_row_bg)
++                    .fg(config.palette.text)
++                    .add_modifier(Modifier::BOLD);
++            }
++            if row.stale {
++                style = style
++                    .fg(config.palette.overlay0)
++                    .add_modifier(Modifier::DIM);
++            }
++            let line = match row.status {
++                Some(status) => Line::from(vec![
++                    ratatui::text::Span::raw("   "),
++                    ratatui::text::Span::styled(
++                        status_icon(status, config.status_indicators),
++                        Style::default().fg(if row.stale {
++                            config.palette.overlay0
++                        } else {
++                            status_color(status, &config.palette)
++                        }),
++                    ),
++                    ratatui::text::Span::raw(format!(" {}", row.label)),
++                ]),
++                None => {
++                    style = style
++                        .fg(config.palette.overlay0)
++                        .add_modifier(Modifier::BOLD);
++                    Line::from(row.label.as_str())
++                }
++            };
++            Paragraph::new(line).style(style).render(rect, buffer);
++            if let Some(pane_id) = &row.pane_id {
++                if let Some(endpoint_id) = &row.endpoint_id {
++                    hits.endpoint_agents
++                        .push((rect, endpoint_id.clone(), pane_id.clone()));
++                } else {
++                    hits.agents.push((rect, pane_id.clone()));
++                }
++            }
++        },
++    );
++}
+diff --git a/src/client/shell/tests/native_agents.rs b/src/client/shell/tests/native_agents.rs
+new file mode 100644
+index 0000000..797fed1
+--- /dev/null
++++ b/src/client/shell/tests/native_agents.rs
+@@ -0,0 +1,95 @@
++use super::*;
++
++#[test]
++fn native_agent_open_captures_remote_context_without_sending_terminal_input() {
++    let (mut state, remote) = state_with_remote();
++    assert!(state.activate_endpoint_projection(&remote));
++    let mut outcome = ClientShellInput::default();
++    state.prepare_native_agent(
++        "pi",
++        "/Applications/Herdr Native.app/Contents/MacOS/herdr-remote",
++        &mut outcome,
++    );
++    assert!(outcome.requests.is_empty());
++    assert!(outcome
++        .actions
++        .iter()
++        .all(|action| !matches!(action, ClientShellAction::Endpoint { .. })));
++    assert_eq!(state.active_endpoint_id, remote);
++    assert!(!outcome.actions.iter().any(|action| matches!(
++        action,
++        ClientShellAction::ActivateEndpoint {
++            endpoint_id: ClientEndpointId::Local,
++            ..
++        }
++    )));
++    let Some(ClientShellAction::OpenNativeAgent { launcher, args }) = outcome.actions.last() else {
++        panic!("expected local launch")
++    };
++    assert_eq!(
++        launcher,
++        "/Applications/Herdr Native.app/Contents/MacOS/herdr-remote"
++    );
++    assert_eq!(
++        args,
++        &[
++            "open",
++            "--agent",
++            "pi",
++            "--machine",
++            "0123456789abcdef0123456789abcdef",
++            "--cwd",
++            "/repo"
++        ]
++    );
++    assert!(state.pending_requests.is_empty());
++}
++
++#[test]
++fn claude_opens_in_remote_workspace_without_touching_existing_terminal() {
++    let (mut state, remote) = state_with_remote();
++    assert!(state.activate_endpoint_projection(&remote));
++    let mut outcome = ClientShellInput::default();
++    state.prepare_native_agent("claude", "/launcher", &mut outcome);
++    assert_eq!(state.active_endpoint_id, remote);
++    assert!(outcome.requests.is_empty());
++    assert!(state.pending_requests.is_empty());
++    let Some(ClientShellAction::OpenNativeAgent { args, .. }) = outcome.actions.last() else {
++        panic!("expected Claude launch")
++    };
++    assert_eq!(
++        args,
++        &[
++            "open",
++            "--agent",
++            "claude",
++            "--machine",
++            "0123456789abcdef0123456789abcdef",
++            "--cwd",
++            "/repo"
++        ]
++    );
++}
++
++#[test]
++fn native_agent_does_not_fall_back_to_a_remote_pane_if_local_is_offline() {
++    let (mut state, remote) = state_with_remote();
++    assert!(state.activate_endpoint_projection(&remote));
++    state.set_endpoint_status(&ClientEndpointId::Local, ClientEndpointStatus::Reconnecting);
++    let mut outcome = ClientShellInput::default();
++    state.prepare_native_agent("codex", "/launcher", &mut outcome);
++    assert!(outcome.actions.is_empty());
++    assert_eq!(state.active_endpoint_id, remote);
++}
++
++#[test]
++fn native_agent_local_view_does_not_mistake_local_cwd_for_remote_project() {
++    let (mut state, _) = state_with_remote();
++    assert!(state.activate_endpoint_projection(&ClientEndpointId::Local));
++    let mut outcome = ClientShellInput::default();
++    state.prepare_native_agent("codex", "/launcher", &mut outcome);
++    let Some(ClientShellAction::OpenNativeAgent { args, .. }) = outcome.actions.last() else {
++        panic!("expected local launch")
++    };
++    assert_eq!(args, &["open", "--agent", "codex"]);
++}
+diff --git a/src/client/shell/tests/new_tab_command.rs b/src/client/shell/tests/new_tab_command.rs
+new file mode 100644
+index 0000000..2bcf3c7
+--- /dev/null
++++ b/src/client/shell/tests/new_tab_command.rs
+@@ -0,0 +1,183 @@
++use super::*;
++use crate::api::schema::{Method, ResponseResult, TabCreateParams, TabInfo};
++
++fn created_tab() -> ResponseResult {
++    let ResponseResult::PaneInfo { mut pane } = pane_scroll_result(0, 0, 20) else {
++        unreachable!()
++    };
++    pane.pane_id = "new-pane".into();
++    pane.tab_id = "new-tab".into();
++    ResponseResult::TabCreated {
++        tab: TabInfo {
++            tab_id: "new-tab".into(),
++            workspace_id: "ws_1".into(),
++            number: 2,
++            label: "new".into(),
++            focused: true,
++            pane_count: 1,
++            agent_status: crate::api::schema::AgentStatus::Unknown,
++        },
++        root_pane: pane,
++    }
++}
++
++fn create_request(command: &str, prompt: bool) -> (ClientShellState, String) {
++    let config: Config = toml::from_str(&format!(
++        "[ui]\nnew_tab_command = {command:?}\nprompt_new_tab_name = {prompt}"
++    ))
++    .unwrap();
++    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
++    state.set_snapshot(Box::new(snapshot()));
++    state.set_endpoint_methods(Some(
++        crate::server::client_commands::supported_client_shell_method_names()
++            .iter()
++            .map(|name| (*name).to_owned())
++            .collect(),
++    ));
++    state.set_pane_surface(surface());
++    let mut outcome = ClientShellInput::default();
++    state.record_binding(
++        crate::input::KeybindMatch::Action(crate::input::KeybindAction::NewTab),
++        &mut outcome,
++    );
++    if prompt {
++        assert!(outcome.actions.is_empty());
++        outcome = state.handle_input_bytes(b"\r");
++    }
++    let [ClientShellAction::Endpoint { request, .. }] = &outcome.actions[..] else {
++        panic!("expected tab creation");
++    };
++    assert!(matches!(
++        request.method,
++        Method::TabCreate(TabCreateParams { .. })
++    ));
++    let id = request.id.clone();
++    (state, id)
++}
++
++#[test]
++fn new_tab_command_runs_once_in_returned_pane_with_or_without_name_prompt() {
++    for prompt in [false, true] {
++        let (mut state, id) = create_request("pi --continue", prompt);
++        let (_, actions) = state.handle_endpoint_result("boot-1", &id, Ok(created_tab()));
++        let [ClientShellAction::Endpoint { request, .. }] = &actions[..] else {
++            panic!("expected startup command");
++        };
++        assert!(matches!(&request.method, Method::PaneSendInput(params)
++            if params.pane_id == "new-pane" && params.text == "pi --continue"
++                && params.keys == ["Enter"]));
++        assert!(state
++            .handle_endpoint_result("boot-1", &id, Ok(created_tab()))
++            .1
++            .is_empty());
++    }
++}
++
++#[test]
++fn new_tab_command_disabled_failed_and_stale_requests_do_not_execute() {
++    for command in ["", "   "] {
++        let (mut state, id) = create_request(command, false);
++        assert!(state
++            .handle_endpoint_result("boot-1", &id, Ok(created_tab()))
++            .1
++            .is_empty());
++    }
++    let (mut state, id) = create_request("pi", false);
++    assert!(state
++        .handle_endpoint_result("other-boot", &id, Ok(created_tab()))
++        .1
++        .is_empty());
++    let (mut state, id) = create_request("pi", false);
++    assert!(state
++        .handle_endpoint_result(
++            "boot-1",
++            &id,
++            Err(ClientShellEndpointError {
++                code: Some("tab_create_failed".into()),
++                message: "failed".into(),
++            })
++        )
++        .1
++        .is_empty());
++}
++
++#[test]
++fn new_tab_command_on_older_server_reports_unsupported_without_sending_input() {
++    let (mut state, id) = create_request("pi", false);
++    state.set_endpoint_methods(Some(vec!["tab.create".into()]));
++    let (repaint, actions) = state.handle_endpoint_result("boot-1", &id, Ok(created_tab()));
++    assert!(repaint);
++    assert!(actions.is_empty());
++    assert!(state
++        .visible_endpoint_notice
++        .as_ref()
++        .unwrap()
++        .body
++        .contains("pane.send_input"));
++}
++
++#[test]
++fn new_tab_command_reloads_from_local_config() {
++    let mut config = ClientShellConfig::from_config(&Config::default());
++    assert!(config.new_tab_command.is_empty());
++    let updated: Config = toml::from_str("[ui]\nnew_tab_command = 'pi'").unwrap();
++    config.apply_live_config(&updated, &[], &[]);
++    assert_eq!(config.new_tab_command, "pi");
++    let updated: Config = toml::from_str("[ui]\nprompt_new_tab_command = true").unwrap();
++    config.apply_live_config(&updated, &[], &[]);
++    assert!(config.prompt_new_tab_command);
++}
++
++#[test]
++fn new_tab_picker_creates_only_after_confirmation_and_runs_selected_command() {
++    for (keys, command) in [
++        (b"\r".as_slice(), "pi"),
++        (b"\x1b[B\r".as_slice(), "claude"),
++        (b"\x1b[B\x1b[B\r".as_slice(), ""),
++    ] {
++        let (mut state, _) = create_request("", false);
++        state.config.prompt_new_tab_command = true;
++        let mut outcome = ClientShellInput::default();
++        state.record_binding(
++            crate::input::KeybindMatch::Action(crate::input::KeybindAction::NewTab),
++            &mut outcome,
++        );
++        assert!(outcome.actions.is_empty());
++        assert!(matches!(
++            state.overlay,
++            Some(ClientShellOverlay::Rename(ClientRenameOverlay {
++                target: ClientRenameTarget::LaunchTab { .. },
++                ..
++            }))
++        ));
++        let outcome = state.handle_input_bytes(keys);
++        let [ClientShellAction::Endpoint { request, .. }] = &outcome.actions[..] else {
++            panic!("expected tab creation");
++        };
++        let id = request.id.clone();
++        let (_, actions) = state.handle_endpoint_result("boot-1", &id, Ok(created_tab()));
++        if command.is_empty() {
++            assert!(actions.is_empty());
++        } else {
++            assert!(
++                matches!(&actions[..], [ClientShellAction::Endpoint { request, .. }]
++                if matches!(&request.method, Method::PaneSendInput(params) if params.pane_id == "new-pane" && params.text == command))
++            );
++        }
++    }
++}
++
++#[test]
++fn new_tab_picker_cancel_does_not_create_a_tab() {
++    let (mut state, _) = create_request("", false);
++    state.config.prompt_new_tab_command = true;
++    let mut outcome = ClientShellInput::default();
++    state.record_binding(
++        crate::input::KeybindMatch::Action(crate::input::KeybindAction::NewTab),
++        &mut outcome,
++    );
++    assert!(outcome.actions.is_empty());
++    let outcome = state.handle_input_bytes(b"\x1b");
++    assert!(outcome.actions.is_empty());
++    assert!(state.overlay.is_none());
++}
+diff --git a/src/client/shell/tests/tab_sidebar.rs b/src/client/shell/tests/tab_sidebar.rs
+new file mode 100644
+index 0000000..464f53c
+--- /dev/null
++++ b/src/client/shell/tests/tab_sidebar.rs
+@@ -0,0 +1,72 @@
++use super::*;
++
++#[test]
++fn workspace_tabs_include_shells_and_collapse_split_panes() {
++    let mut snapshot = snapshot();
++    let mut split = snapshot.panes[0].clone();
++    split.pane_id = "split".into();
++    split.focused = false;
++    snapshot.panes.push(split);
++    let mut workspace = snapshot.workspaces[0].clone();
++    workspace.workspace_id = "ws_2".into();
++    workspace.label = "second".into();
++    workspace.focused = false;
++    snapshot.workspaces.push(workspace);
++    let mut tab = snapshot.tabs[0].clone();
++    tab.workspace_id = "ws_2".into();
++    tab.tab_id = "tab_2".into();
++    snapshot.tabs.push(tab);
++    let mut pane = snapshot.panes[0].clone();
++    pane.workspace_id = "ws_2".into();
++    pane.tab_id = "tab_2".into();
++    pane.pane_id = "pane_2".into();
++    snapshot.panes.push(pane);
++    let mut rows = Vec::new();
++    tab_sidebar::append_rows(&mut rows, &snapshot, None, true);
++    assert_eq!(rows.len(), 4, "one header and one tab per workspace");
++    assert!(rows[0].pane_id.is_none());
++    assert_eq!(rows[1].pane_id.as_deref(), Some("pane_1"));
++    assert!(rows[2].pane_id.is_none());
++    assert_eq!(rows[3].pane_id.as_deref(), Some("pane_2"));
++    let config = ClientShellConfig::from_config(&Config::default());
++    let area = Rect::new(0, 0, 40, 10);
++    let mut buffer = Buffer::empty(area);
++    let mut hits = ShellHitMap::default();
++    tab_sidebar::render(&mut buffer, area, &rows, &config, &mut 0, &mut hits);
++    assert_eq!(hits.agents.len(), 2);
++    assert_eq!(hits.agents[0].0.height, 1);
++    assert_eq!(hits.agents[0].0.y, 3);
++    assert_eq!(hits.agents[1].0.y, 5);
++    assert!(hits.agent_sort_toggle.is_empty());
++}
++
++#[test]
++fn workspace_tabs_scroll_and_keep_click_targets_aligned() {
++    let mut snapshot = snapshot();
++    for number in 2..=15 {
++        let mut tab = snapshot.tabs[0].clone();
++        tab.tab_id = format!("tab_{number}");
++        tab.focused = false;
++        snapshot.tabs.push(tab);
++        let mut pane = snapshot.panes[0].clone();
++        pane.tab_id = format!("tab_{number}");
++        pane.pane_id = format!("pane_{number}");
++        pane.focused = false;
++        snapshot.panes.push(pane);
++    }
++    let mut rows = Vec::new();
++    tab_sidebar::append_rows(&mut rows, &snapshot, None, true);
++    let config = ClientShellConfig::from_config(&Config::default());
++    let area = Rect::new(0, 0, 40, 7);
++    let mut buffer = Buffer::empty(area);
++    let mut hits = ShellHitMap::default();
++    let mut scroll = 12;
++    tab_sidebar::render(&mut buffer, area, &rows, &config, &mut scroll, &mut hits);
++    assert!(!hits.agent_scrollbar.is_empty());
++    assert_eq!(hits.agents.len(), 5);
++    assert_eq!(hits.agents.last().unwrap().1, "pane_15");
++    assert!(hits
++        .agents
++        .iter()
++        .all(|(rect, _)| rect.height == 1 && rect.y < area.bottom()));
++}
+diff --git a/src/client/shell/tests/workspace_tab_endpoints.rs b/src/client/shell/tests/workspace_tab_endpoints.rs
+new file mode 100644
+index 0000000..9b4a476
+--- /dev/null
++++ b/src/client/shell/tests/workspace_tab_endpoints.rs
+@@ -0,0 +1,28 @@
++use super::*;
++
++#[test]
++fn workspace_tabs_keep_remote_shell_targets_separate() {
++    let (state, remote) = state_with_remote();
++    let rows = crate::client::shell::tab_sidebar::endpoint_rows(
++        &state.endpoints,
++        &state.active_endpoint_id,
++    );
++    assert_eq!(rows.len(), 4);
++    let area = Rect::new(0, 0, 40, 10);
++    let mut buffer = Buffer::empty(area);
++    let mut hits = ShellHitMap::default();
++    crate::client::shell::tab_sidebar::render(
++        &mut buffer,
++        area,
++        &rows,
++        &state.config,
++        &mut 0,
++        &mut hits,
++    );
++    assert_eq!(hits.endpoint_agents.len(), 2);
++    assert_eq!(hits.endpoint_agents[0].1, ClientEndpointId::Local);
++    assert_eq!(hits.endpoint_agents[1].1, remote);
++    assert_eq!(hits.endpoint_agents[0].2, "pane_1");
++    assert_eq!(hits.endpoint_agents[1].2, "pane_1");
++    assert!(hits.agents.is_empty());
++}

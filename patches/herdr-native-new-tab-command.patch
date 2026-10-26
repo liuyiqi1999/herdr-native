@@ -1,0 +1,135 @@
+diff --git a/src/api/schema.rs b/src/api/schema.rs
+index 8077377..d2d48e0 100644
+--- a/src/api/schema.rs
++++ b/src/api/schema.rs
+@@ -119,7 +119,7 @@ operations::define_operations! {
+     PaneRename(PaneRenameParams) => "pane.rename", true, true;
+     PaneSendText(PaneSendTextParams) => "pane.send_text", false, false;
+     PaneSendKeys(PaneSendKeysParams) => "pane.send_keys", false, false;
+-    PaneSendInput(PaneSendInputParams) => "pane.send_input", false, false;
++    PaneSendInput(PaneSendInputParams) => "pane.send_input", false, true;
+     PaneRead(PaneReadParams) => "pane.read", false, false;
+     PaneReportAgent(PaneReportAgentParams) => "pane.report_agent", true, false;
+     PaneReportAgentSession(PaneReportAgentSessionParams) => "pane.report_agent_session", true, false;
+diff --git a/src/client/shell/tests/new_tab_command.rs b/src/client/shell/tests/new_tab_command.rs
+index f75118c..baec80c 100644
+--- a/src/client/shell/tests/new_tab_command.rs
++++ b/src/client/shell/tests/new_tab_command.rs
+@@ -24,9 +24,16 @@ fn created_tab() -> ResponseResult {
+ fn create_request(command: &str, prompt: bool) -> (ClientShellState, String) {
+     let config: Config = toml::from_str(&format!(
+         "[ui]\nnew_tab_command = {command:?}\nprompt_new_tab_name = {prompt}"
+-    )).unwrap();
++    ))
++    .unwrap();
+     let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+     state.set_snapshot(Box::new(snapshot()));
++    state.set_endpoint_methods(Some(
++        crate::server::client_commands::supported_client_shell_method_names()
++            .iter()
++            .map(|name| (*name).to_owned())
++            .collect(),
++    ));
+     state.set_pane_surface(surface());
+     let mut outcome = ClientShellInput::default();
+     state.record_binding(
+@@ -40,7 +47,10 @@ fn create_request(command: &str, prompt: bool) -> (ClientShellState, String) {
+     let [ClientShellAction::Endpoint { request, .. }] = &outcome.actions[..] else {
+         panic!("expected tab creation");
+     };
+-    assert!(matches!(request.method, Method::TabCreate(TabCreateParams { .. })));
++    assert!(matches!(
++        request.method,
++        Method::TabCreate(TabCreateParams { .. })
++    ));
+     let id = request.id.clone();
+     (state, id)
+ }
+@@ -56,7 +66,10 @@ fn new_tab_command_runs_once_in_returned_pane_with_or_without_name_prompt() {
+         assert!(matches!(&request.method, Method::PaneSendInput(params)
+             if params.pane_id == "new-pane" && params.text == "pi --continue"
+                 && params.keys == ["Enter"]));
+-        assert!(state.handle_endpoint_result("boot-1", &id, Ok(created_tab())).1.is_empty());
++        assert!(state
++            .handle_endpoint_result("boot-1", &id, Ok(created_tab()))
++            .1
++            .is_empty());
+     }
+ }
+ 
+@@ -64,14 +77,43 @@ fn new_tab_command_runs_once_in_returned_pane_with_or_without_name_prompt() {
+ fn new_tab_command_disabled_failed_and_stale_requests_do_not_execute() {
+     for command in ["", "   "] {
+         let (mut state, id) = create_request(command, false);
+-        assert!(state.handle_endpoint_result("boot-1", &id, Ok(created_tab())).1.is_empty());
++        assert!(state
++            .handle_endpoint_result("boot-1", &id, Ok(created_tab()))
++            .1
++            .is_empty());
+     }
+     let (mut state, id) = create_request("pi", false);
+-    assert!(state.handle_endpoint_result("other-boot", &id, Ok(created_tab())).1.is_empty());
++    assert!(state
++        .handle_endpoint_result("other-boot", &id, Ok(created_tab()))
++        .1
++        .is_empty());
+     let (mut state, id) = create_request("pi", false);
+-    assert!(state.handle_endpoint_result("boot-1", &id, Err(ClientShellEndpointError {
+-        code: Some("tab_create_failed".into()), message: "failed".into(),
+-    })).1.is_empty());
++    assert!(state
++        .handle_endpoint_result(
++            "boot-1",
++            &id,
++            Err(ClientShellEndpointError {
++                code: Some("tab_create_failed".into()),
++                message: "failed".into(),
++            })
++        )
++        .1
++        .is_empty());
++}
++
++#[test]
++fn new_tab_command_on_older_server_reports_unsupported_without_sending_input() {
++    let (mut state, id) = create_request("pi", false);
++    state.set_endpoint_methods(Some(vec!["tab.create".into()]));
++    let (repaint, actions) = state.handle_endpoint_result("boot-1", &id, Ok(created_tab()));
++    assert!(repaint);
++    assert!(actions.is_empty());
++    assert!(state
++        .visible_endpoint_notice
++        .as_ref()
++        .unwrap()
++        .body
++        .contains("pane.send_input"));
+ }
+ 
+ #[test]
+diff --git a/src/main.rs b/src/main.rs
+index f97e7e2..dee953c 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -287,6 +287,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+ # Ask for a tab name before creating a new tab.
+ # Set false to create tabs immediately with generated names.
+ # prompt_new_tab_name = true
++# new_tab_command = "" # e.g. "pi"; run once in each tab created by the client
+ 
+ # Ask for a workspace name before interactive creation.
+ # prompt_new_workspace_name = false
+diff --git a/src/server/client_commands.rs b/src/server/client_commands.rs
+index 97092b4..3d5861d 100644
+--- a/src/server/client_commands.rs
++++ b/src/server/client_commands.rs
+@@ -246,6 +246,10 @@ mod tests {
+         .expect("endpoint method shape fixture");
+         let mut actual = endpoint_method_shape_digests();
+         // Freeze additive methods separately without rewriting the published fixture.
++        assert_eq!(
++            actual.remove("pane.send_input").as_deref(),
++            Some("b0984bc72d68f720d07555147e6a8f14d6f7cf75376e6a3da3a393ca8f2e29a7")
++        );
+         assert_eq!(
+             actual.remove("pane.clear").as_deref(),
+             Some("0301d288ba198ddaa427dd7421c71911cccaf4ea03544531efa8b67ca21b08f6")

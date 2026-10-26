@@ -1,0 +1,28 @@
+diff --git a/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift b/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift
+index edbbd61..633ad02 100644
+--- a/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift	
++++ b/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift	
+@@ -907,6 +907,23 @@ extension Ghostty {
+         }
+ 
+         override func mouseUp(with event: NSEvent) {
++            // Herdr's independently attached clients cannot see another surface's
++            // geometry. Publish the actual native hit target before sending the
++            // terminal mouse release; the client only uses it for tab drags.
++            if let root = ProcessInfo.processInfo.environment["HERDR_NATIVE_GROUP_ROOT"],
++               let content = window?.contentView {
++                try? "".write(toFile: root + "/drop-surface", atomically: true, encoding: .utf8)
++                let point = content.convert(event.locationInWindow, from: nil)
++                var hit = content.hitTest(point)
++                while let view = hit {
++                    if let target = view as? Ghostty.SurfaceView {
++                        let record = "\(Date().timeIntervalSince1970)\n\(target.id.uuidString)"
++                        try? record.write(toFile: root + "/drop-surface", atomically: true, encoding: .utf8)
++                        break
++                    }
++                    hit = view.superview
++                }
++            }
+             // If this mouse-up corresponds to a focus-only click transfer,
+             // suppress it so we don't emit a release without a press.
+             if suppressNextLeftMouseUp {
