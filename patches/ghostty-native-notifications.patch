@@ -1,0 +1,63 @@
+diff --git a/macos/Sources/Ghostty/Ghostty.App.swift b/macos/Sources/Ghostty/Ghostty.App.swift
+index b9dc4b2..1187356 100644
+--- a/macos/Sources/Ghostty/Ghostty.App.swift
++++ b/macos/Sources/Ghostty/Ghostty.App.swift
+@@ -1610,7 +1610,10 @@ extension Ghostty {
+                 guard let surfaceView = self.surfaceView(from: surface) else { return }
+                 guard let title = String(cString: n.title!, encoding: .utf8) else { return }
+                 guard let body = String(cString: n.body!, encoding: .utf8) else { return }
+-                showDesktopNotification(surfaceView, title: title, body: body)
++                // Herdr already filters notifications by its inner tab focus. The
++                // outer terminal surface cannot distinguish those background tabs.
++                let herdrHost = Bundle.main.bundleIdentifier?.hasPrefix("dev.herdr.native.") == true
++                showDesktopNotification(surfaceView, title: title, body: body, requireFocus: !herdrHost)
+ 
+             default:
+                 assertionFailure()
+@@ -1623,19 +1626,23 @@ extension Ghostty {
+             body: String,
+             requireFocus: Bool = true) {
+             let center = UNUserNotificationCenter.current()
+-            center.requestAuthorization(options: [.alert, .sound]) { _, error in
++            center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+                 if let error = error {
+                     Ghostty.logger.error("Error while requesting notification authorization: \(error, privacy: .public)")
+                 }
+-            }
+-
+-            center.getNotificationSettings { settings in
+-                guard settings.authorizationStatus == .authorized else { return }
+-                surfaceView.showUserNotification(
+-                    title: title,
+-                    body: body,
+-                    requireFocus: requireFocus
+-                )
++                guard granted else {
++                    Ghostty.logger.warning("Desktop notifications denied; enable them in System Settings > Notifications")
++                    return
++                }
++                // Wait for authorization (including the first prompt), then touch
++                // AppKit surface state only on the main thread.
++                DispatchQueue.main.async {
++                    surfaceView.showUserNotification(
++                        title: title,
++                        body: body,
++                        requireFocus: requireFocus
++                    )
++                }
+             }
+         }
+ 
+diff --git a/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift b/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift
+index edbbd61..ed7f48e 100644
+--- a/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift	
++++ b/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift	
+@@ -1814,7 +1814,7 @@ extension Ghostty {
+                     // If we're focused then we schedule to remove the notification
+                     // after a few seconds. If we gain focus we automatically remove it
+                     // in focusDidChange.
+-                    if focused {
++                    if focused && requireFocus {
+                         // If the suspension is failed, we remove the notification anyway.
+                         try? await Task.sleep(for: .seconds(3))
+                         self?.notificationIdentifiers.remove(uuid)

@@ -1,93 +1,44 @@
-Herdr Native tab splits
-=======================
+Herdr Native — plain UI and built-in splitting
 
-Implementation:
-- herdr-worktrees/tab-groups/src/client/shell/native_tab_groups.rs
-- scripts/native_tab_group.py
-- ghostty/macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift
+Only Herdr's built-in pane splitting is supported.
+Cmd+D splits right; Cmd+Shift+D splits down. Pane context-menu splits,
+focus, resize, zoom and close use the upstream Herdr implementation.
 
-Local tabs: context menu -> Split to right/down/left/up.
-Cmd+D followed by an arrow within 450 ms selects a direction; no arrow
-splits right. Esc cancels. Command can remain held for the arrow.
-Cmd+Shift+D retains immediate down behavior. Ctrl+D is passed to the terminal
-as normal (EOF); it no longer starts a split. Cmd+arrows without a pending
-Cmd+D chord retain workspace-local tab navigation.
-Tab captions do not prepend stable tab numbers. Numeric server placeholders
-show as "未命名"; meaningful automatic names and explicit user labels (including
-numbers in those labels) remain intact. Stable IDs and numeric shortcuts do not
-change. Releasing a small drag over the same tab still focuses it. Native
-Herdr surfaces pass through the first click when transferring split focus, so
-one click can both focus an inactive split and select its tab.
-Each native tab strip remains restricted to its group when agent status/seen
-acknowledgements refresh the snapshot. The endpoint cache remains global for
-the shared sidebar; it must never be copied to the strip without group filtering.
-These move a tab into an independent native terminal surface; they do not
-clone or restart its PTY. Splitting/moving the only tab leaves a new shell
-in the source group. Remote endpoint tabs are not supported by this existing
-native-group implementation.
+Removed: custom native tab groups, four-way tab splitting, cross-surface
+tab drag/drop, tab ownership files, split chord timers, workspace host
+layout caching, move-tab-right helper, and Liquid Glass presentation.
+Upstream tab reordering and pane-divider dragging remain unchanged.
+The client uses standard TUI chrome. Completed unread tabs flash their
+background in both the top strip and sidebar, stopping when marked read.
+The Ghostty notification patch lets Herdr's already-filtered background-tab
+notifications appear even while the outer surface is focused, and waits for
+notification authorization before sending. macOS notification permission is
+still required.
 
-With the rebuilt Ghostty host, drag a tab from its strip into another
-existing group and release anywhere inside that group's terminal surface.
-Within-strip reordering is unchanged. Cross-window drops and edge-created
-splits during dragging are not implemented. There is no drop-zone preview.
+Build (legacy build script/worktree names retained):
+  cd herdr-worktrees/tab-groups
+  ZIG="$PWD/../../.tools/zig/ziglang/zig" CARGO_TARGET_DIR=../../herdr/target CARGO_PROFILE_RELEASE_OPT_LEVEL=1 cargo build --release --locked
+  cd ../../ghostty
+  macos/build.nu --configuration ReleaseLocal --action build
+  cd ..
+  python3 scripts/build_tab_groups.py --ghostty-app ghostty/macos/build/ReleaseLocal/Ghostty.app --output 'dist/Herdr Native Plain.app'
 
-Only the primary native group renders the sidebar. Secondary surfaces have
-zero sidebar width (not the compact four-column rail), including after config
-reload, endpoint changes, and Cmd+B. They do not persist sidebar preferences
-back over the primary group's settings. The Ghostty profile and optional glass
-profile use unfocused-split-opacity = 1 so switching native focus does not dim
-the shared sidebar (or the rest of the inactive split).
-Existing sessions can hide compact rails by reloading the local [ui] setting
-sidebar_collapsed_mode = "hidden"; the new client enforces suppression even
-if a remote endpoint or later preference requests a compact/expanded sidebar.
+Regression smoke (use --test when packaging):
+  HERDR_TEST_APP="$PWD/dist/Herdr Native Plain Test.app" python3 scripts/smoke_builtin_splits.py
+Checks both split shortcuts create backend panes in the same tab, without
+creating additional Ghostty surfaces/clients. Checks existing terminal IDs,
+new-tab creation, absence of glass resources and stale environment isolation.
 
-The host publishes the native hit-tested surface UUID before delivering the
-terminal mouse release. The source client rejects stale/unknown/self targets;
-the helper serializes ownership transfers with the existing group lock.
-Group ownership is scoped to an app launch and server boot. No shared wire
-codec or server protocol is changed.
+Current source (apply each patch once to its matching clean upstream base):
+  Herdr base: 143bf5fd4781d164260c63fe28e7dc08054ad32f
+  Herdr patch: patches/herdr-native-completion-alerts-complete.patch
+  Ghostty base: 48dde97e0413a27064e4c6182db3df6ee999db7d
+  Ghostty patch: patches/ghostty-native-notifications.patch
+The Herdr patch includes the completion-flash regression tests and an ignored
+fixed-geometry scaling profile. It is a complete patch, not an incremental
+patch to stack on the earlier built-in-splits patch.
 
-Build from the project root:
-  (cd herdr-worktrees/tab-groups && ZIG="$PWD/../../.tools/zig/ziglang/zig" CARGO_TARGET_DIR=../../herdr/target CARGO_PROFILE_RELEASE_OPT_LEVEL=1 cargo build --release --locked)
-  (cd ghostty && ../.tools/zig-aarch64-macos-0.17.0/zig build -Demit-macos-app=false -Doptimize=ReleaseFast)
-  nu ghostty/macos/build.nu --configuration ReleaseLocal
-  python3 scripts/build_tab_groups.py --test --ghostty-app ghostty/macos/build/ReleaseLocal/Ghostty.app --output 'dist/Herdr Native Tab Splits.app'
-
-The --ghostty-app option must point to a host built with the drop bridge.
-Without it the package supports four-way splits but NOT cross-group dragging.
-The actual Ghostty output path depends on its build configuration.
-
-Validation commands (just/nextest unavailable on this machine):
-  python3 -m unittest discover -s scripts -p test_native_tab_group.py -v
-  (cd herdr-worktrees/tab-groups && ZIG="$PWD/../../.tools/zig/ziglang/zig" CARGO_TARGET_DIR=../../herdr/target cargo test --locked --bin herdr native_tab_group)
-  HERDR_TEST_BIN="$PWD/herdr/target/release/herdr" python3 scripts/smoke_native_tab_groups.py
-
-Current validation: seven Python helper tests and six Rust native-group tests
-pass. Real PTY smoke covers four directional chords, default-right, Escape,
-disjoint groups, transfers, unchanged terminal identities, and detach.
-Native GUI smoke also passes all four Cmd+D arrow splits, default Cmd+D, Cmd+T,
-and preserved original PTYs using the installed host engine.
-Installed: /Applications/Herdr Native.app, with four-way splits AND native
-cross-group drops. Bundle identity, launcher, client, existing configuration,
-and live sessions were retained when updating the host.
-Native validation: `nu ghostty/macos/build.nu --configuration Debug --action test`
-passes all 412 macOS tests, including real SurfaceView.mouseUp events over
-another surface, clearing the mailbox for outside drops, and native hit testing
-for children, gaps, and outside coordinates. Real PTY smoke additionally
-checks SGR press/drag/release -> target-group routing and preserved terminal IDs.
-The rebuilt packaged app passes the four-direction native GUI smoke plus a
-real cross-group transfer: destination native surface gains focus, no new
-surface is created, and all original terminal IDs remain unchanged. If that
-surface closes before focus succeeds, ownership and focus mailboxes roll back.
-System-level physical mouse automation was not used (Accessibility permission
-is not granted); native AppKit events were exercised inside the test host.
-The broader shell suite has 383 passing, 17 failing, and 2 ignored tests;
-failures are in sidebar/agent/endpoint tests and remain unresolved.
-
-Toolchain blocker resolved: `xcodebuild -runFirstLaunch` updated the mismatched
-DVTDownloads system framework; `xcodebuild -downloadComponent MetalToolchain`
-then installed Metal Toolchain 27A266a. Full native build and Debug tests pass.
-ReleaseLocal unit testing does not support @testable imports; use Debug tests.
-Relaunch the client when convenient to load the new host and use cross-group
-mouse drops. No running clients or backend sessions were forcibly restarted.
-Source patches remain bundled in Contents/Resources/ghostty-tab-drop.patch.
+The packaging script uses /Applications/Herdr Native.app as its bundle template
+and the legacy herdr-worktrees/tab-groups checkout as its source-patch input.
+Older complete patches and patches under archived-builds are historical, not
+the current build.

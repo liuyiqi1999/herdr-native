@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package the isolated native/tab-groups build without altering the installed app."""
+"""Package the plain client with Herdr's built-in pane splitting only."""
 import argparse
 import hashlib
 import json
@@ -12,19 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser()
 parser.add_argument('--output',type=Path,required=True)
 parser.add_argument('--test',action='store_true')
-parser.add_argument('--glass', action='store_true', help='Bundle native Liquid Glass presentation (requires rebuilt engine and client)')
 parser.add_argument('--herdr', type=Path, default=ROOT/'herdr/target/release/herdr')
-parser.add_argument('--ghostty-app', type=Path, help='Rebuilt Ghostty.app with the native drop-target bridge')
+parser.add_argument('--ghostty-app', type=Path, help='Ghostty.app engine built with patches/ghostty-native-notifications.patch')
 args=parser.parse_args()
 if args.output.exists():parser.error('Output already exists; choose a fresh path')
-if args.glass and not args.ghostty_app:
-    parser.error('--glass requires --ghostty-app with the native glass bridge')
 if not args.herdr.is_file():
     parser.error(f'Herdr binary not found: {args.herdr}')
 shutil.copytree('/Applications/Herdr Native.app',args.output,symlinks=True)
 contents=args.output/'Contents'
-# Upgrade copied installations too: losing native split focus must not dim
-# the primary surface's shared sidebar.
+# Keep the presentation configuration consistent in copied installations.
 config_path = contents/'Resources/ghostty.conf'
 config_lines = [line for line in config_path.read_text().splitlines()
                 if not line.strip().startswith('unfocused-split-opacity')]
@@ -39,15 +35,14 @@ if args.ghostty_app:
         subprocess.run(['ditto', str(engine_contents / 'Frameworks'), str(contents / 'Frameworks')], check=True)
 binary=contents/'MacOS/herdr'
 shutil.copy2(args.herdr,binary)
-if args.glass:
-    shutil.copy2(ROOT/'native/native-glass.conf', contents/'Resources/native-glass.conf')
-shutil.copy2(ROOT/'scripts/native_tab_group.py',contents/'Resources/native_tab_group.py')
+for obsolete in ['native_tab_group.py', 'ghostty-tab-drop.patch', 'native-glass.conf', 'ghostty-glass.patch']:
+    (contents/'Resources'/obsolete).unlink(missing_ok=True)
 subprocess.run(['xcrun','swiftc',str(ROOT/'native/TabGroupsLauncher.swift'),'-O','-o',str(contents/'MacOS/HerdrNative')],check=True)
 if args.test:
     path=contents/'Info.plist'
     info=plistlib.loads(path.read_bytes())
-    info['CFBundleIdentifier']='dev.herdr.native.glass-test' if args.glass else 'dev.herdr.native.tab-groups-test'
-    info['CFBundleName']='Herdr Native Glass Test' if args.glass else 'Herdr Native Tab Groups Test'
+    info['CFBundleIdentifier']='dev.herdr.native.builtin-test'
+    info['CFBundleName']='Herdr Native Builtin Test'
     path.write_bytes(plistlib.dumps(info))
 source=ROOT/'herdr-worktrees/tab-groups'
 patch=subprocess.check_output(['git','-C',str(source),'diff','--binary','HEAD'])
@@ -61,15 +56,15 @@ for name in subprocess.check_output(['git', '-C', str(ROOT/'ghostty'), 'ls-files
     p = subprocess.run(['git', 'diff', '--no-index', '--binary', '--', '/dev/null', name], cwd=ROOT/'ghostty', capture_output=True)
     if p.returncode not in (0, 1): raise RuntimeError(p.stderr.decode())
     ghostty_patch += p.stdout
-(contents/'Resources/ghostty-tab-drop.patch').write_bytes(ghostty_patch)
+(contents/'Resources/ghostty-engine.patch').write_bytes(ghostty_patch)
 provenance=json.loads((contents/'Resources/provenance.json').read_text())
 provenance.update(herdr_binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                   herdr_complete_patch_sha256=hashlib.sha256(patch).hexdigest(),
-                  native_feature=('four-way tab splits and cross-group tab drops' if args.ghostty_app else 'four-way tab splits; native drop bridge not bundled'),
-                  native_drop_bridge=bool(args.ghostty_app),
-                  native_liquid_glass=args.glass,
-                  ghostty_binary_sha256=hashlib.sha256((contents/'MacOS/ghostty').read_bytes()).hexdigest(),
-                  native_group_helper_sha256=hashlib.sha256((contents/'Resources/native_tab_group.py').read_bytes()).hexdigest())
+                  native_feature='Herdr built-in pane splits only',
+                  native_drop_bridge=False,
+                  native_liquid_glass=False,
+                  ghostty_binary_sha256=hashlib.sha256((contents/'MacOS/ghostty').read_bytes()).hexdigest())
+provenance.pop('native_group_helper_sha256', None)
 (contents/'Resources/provenance.json').write_text(json.dumps(provenance,indent=2)+'\n')
 subprocess.run(['codesign','--force','--deep','--sign','-',str(args.output)],check=True)
 subprocess.run(['codesign','--verify','--deep','--strict',str(args.output)],check=True)

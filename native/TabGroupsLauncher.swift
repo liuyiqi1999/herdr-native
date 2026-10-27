@@ -35,12 +35,11 @@ do {
 let bin = bundle.bundleURL.appendingPathComponent("Contents/MacOS")
 setenv("HERDR_CONFIG_PATH", config.path, 1)
 setenv("HERDR_SESSION", session, 1)
-let groupRoot = fm.temporaryDirectory.appendingPathComponent("herdr-groups-\(UUID().uuidString)")
-do { try fm.createDirectory(at: groupRoot, withIntermediateDirectories: true) }
-catch { fail(error.localizedDescription) }
-setenv("HERDR_NATIVE_GROUP_ROOT", groupRoot.path, 1)
-setenv("HERDR_NATIVE_GROUP_ID", "main", 1)
-setenv("HERDR_NATIVE_GROUP_LAUNCHER", resources.appendingPathComponent("native_tab_group.py").path, 1)
+// Ignore obsolete customization flags inherited from an older application.
+for key in ["HERDR_NATIVE_GROUP_ROOT", "HERDR_NATIVE_GROUP_ID", "HERDR_NATIVE_GROUP_LAUNCHER",
+            "HERDR_NATIVE_GLASS", "HERDR_NATIVE_GLASS_ROOT", "HERDR_NATIVE_SURFACE_UUID"] {
+    unsetenv(key)
+}
 setenv("HERDR_NATIVE_APP", bundle.bundlePath, 1)
 setenv("HERDR_REMOTE_LAUNCHER", bin.appendingPathComponent("herdr-remote").path, 1)
 // This launcher creates an independent desktop client, even when invoked
@@ -61,15 +60,10 @@ let engine = bin.appendingPathComponent("ghostty").path
 // existing paths after `-e` as open-file requests and create a second surface.
 // The bundle's MacOS directory is first in PATH, so this resolves to our Herdr
 // even when the application path contains spaces, without invoking a shell.
-let glassConfig = resources.appendingPathComponent("native-glass.conf")
-let useGlass = fm.fileExists(atPath: glassConfig.path)
-    && ProcessInfo.processInfo.environment["HERDR_NATIVE_GLASS"] != "0"
-setenv("HERDR_NATIVE_GLASS", useGlass ? "1" : "0", 1)
-var arguments = [engine, "--config-default-files=false",
+let arguments = [engine, "--config-default-files=false",
                  "--config-file=\(resources.appendingPathComponent("ghostty.conf").path)",
                  "--working-directory=\(home)",
                  "--initial-command=direct:herdr --session \(session)"]
-if useGlass { arguments.append("--config-file=\(glassConfig.path)") }
 let pointers = arguments.map { strdup($0) } + [nil]
 pointers.withUnsafeBufferPointer { buffer in
     _ = execv(engine, buffer.baseAddress!)
